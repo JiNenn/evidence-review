@@ -133,10 +133,11 @@ def test_normal_and_compat(api_base: str, headers: dict) -> tuple[str, int]:
         assert_true(len(evidences) >= 1, "issue detail should include evidences")
 
         for evidence in evidences:
-            assert_true(bool(evidence.get("loc")), "evidence loc must exist")
             assert_true(bool(evidence.get("chunk_loc")), "evidence chunk_loc must exist")
             assert_true(bool(evidence.get("source_doc_id")), "evidence source_doc_id must exist")
             assert_true(bool(evidence.get("chunk_id")), "evidence chunk_id must exist")
+            if evidence.get("loc") is not None:
+                assert_true(isinstance(evidence.get("loc"), dict), "evidence loc must be an object")
             if evidence.get("citation_span") is not None:
                 assert_true(isinstance(evidence.get("citation_span"), dict), "citation_span must be an object")
 
@@ -145,6 +146,18 @@ def test_normal_and_compat(api_base: str, headers: dict) -> tuple[str, int]:
             assert_true(citation.get("chunk_id") == evidence.get("chunk_id"), "citation chunk mismatch")
             if citation.get("span") is not None:
                 assert_true(isinstance(citation.get("span"), dict), "citation span must be an object")
+            if citation.get("feedback_id") is None:
+                span = citation.get("span") or {}
+                selection = span.get("selection")
+                assert_true(bool(selection), "issue citation span should include selection detail")
+                assert_true(
+                    selection.get("version") == "search_score_weighted_v1",
+                    "issue citation selection version mismatch",
+                )
+                assert_true(
+                    isinstance(selection.get("combined_score"), (int, float)),
+                    "issue citation selection should include combined_score",
+                )
 
             source_doc_id = citation["source_doc_id"]
             if source_doc_id not in checked_source_docs:

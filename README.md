@@ -58,6 +58,7 @@ docker compose up --build
   - Issue is displayed only when evidence(s) exist
   - `status=hidden` の issue は API/UI の一覧表示対象外
   - evidence は `citation -> source_doc_id/chunk_id/loc` まで辿れる（`span` は任意）
+  - `attach_evidence_to_issues` は `SearchResult.score` 重み付き（0.7）+ lexical一致度（0.3）で根拠候補を選定し、`citation.span.selection` に選定理由を残す
   - evidence不足時は `search_chunks` を固定戦略で再実行（strict -> relaxed -> vector fallback, 最大3回）してから `blocked_evidence` 判定
 
 ## Notes

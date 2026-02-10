@@ -104,7 +104,7 @@ class IssueEvidenceResponse(BaseModel):
     citation_span: Optional[Dict[str, Any]]
     before_excerpt: Optional[str]
     after_excerpt: Optional[str]
-    loc: Dict[str, Any]
+    loc: Optional[Dict[str, Any]]
     source_title: str
     source_presigned_url: str
     chunk_text: str

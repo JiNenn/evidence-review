@@ -332,6 +332,9 @@
 
   * UI表示対象 issue ごとに `issue_evidences >= 1`
   * issue_evidence が参照する citation の chunk が実在し、`loc` で原文へ戻れる
+  * 根拠候補の選定は `SearchResult.score` を主（重み0.7）に、論点テキストとの lexical一致度（重み0.3）を合成した
+    `combined_score` で決定する（SearchResultが無い場合は lexical一致度のみ）
+  * 同点時は `search_rank -> chunk_index -> chunk_id` で決定し、再実行時の再現性を担保する
   * `span` は任意（存在する場合のみ妥当性チェック）
 * 根拠を付与できない issue は `hidden` 扱いとし、UI表示しない
 * 根拠不足により全 issue が hidden になる場合は `run.status=blocked_evidence` とし、

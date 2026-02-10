@@ -52,6 +52,23 @@ def hash_key(*values: Any) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def digest_rows(rows: list[tuple[Any, ...]]) -> str:
+    """Build a deterministic compact signature from ordered DB rows."""
+    hasher = hashlib.sha256()
+    for row in rows:
+        for value in row:
+            if isinstance(value, datetime):
+                serialized = value.isoformat()
+            elif isinstance(value, uuid.UUID):
+                serialized = str(value)
+            else:
+                serialized = str(value)
+            hasher.update(serialized.encode("utf-8"))
+            hasher.update(b"|")
+        hasher.update(b";")
+    return hasher.hexdigest()
+
+
 def stage_idempotency_key(
     *,
     run_id: str,
@@ -200,22 +217,84 @@ def tokens(text: str) -> set[str]:
     return set(re.findall(r"\w+", (text or "").lower()))
 
 
-def choose_best_chunk(chunks: list[SourceChunk], hint_text: str) -> SourceChunk | None:
-    if not chunks:
+def clamp_score(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(parsed, 1.0))
+
+
+def lexical_match_score(hint_text: str, chunk_text: str) -> float:
+    normalized_hint = " ".join((hint_text or "").lower().split())
+    normalized_chunk = " ".join((chunk_text or "").lower().split())
+    if not normalized_hint or not normalized_chunk:
+        return 0.0
+
+    hint_tokens = tokens(normalized_hint)
+    chunk_tokens = tokens(normalized_chunk)
+    token_score = 0.0
+    if hint_tokens and chunk_tokens:
+        overlap = len(hint_tokens.intersection(chunk_tokens))
+        token_recall = overlap / max(len(hint_tokens), 1)
+        token_precision = overlap / max(len(chunk_tokens), 1)
+        token_score = 0.75 * token_recall + 0.25 * token_precision
+
+    # Token overlap may be weak for some scripts; keep a short literal-match boost.
+    prefix = normalized_hint[:24]
+    prefix_hit = 1.0 if prefix and prefix in normalized_chunk else 0.0
+    return max(0.0, min(1.0, 0.85 * token_score + 0.15 * prefix_hit))
+
+
+def choose_best_chunk(
+    candidates: list[Dict[str, Any]],
+    hint_text: str,
+) -> Dict[str, Any] | None:
+    if not candidates:
         return None
-    hint_tokens = tokens(hint_text)
-    best_score = -1.0
-    best: SourceChunk | None = None
-    for chunk in chunks:
-        chunk_tokens = tokens(chunk.text)
-        overlap = len(hint_tokens.intersection(chunk_tokens)) if hint_tokens else 0
-        score = float(overlap)
-        if hint_text and hint_text[:16] and hint_text[:16] in (chunk.text or ""):
-            score += 2.0
-        if score > best_score:
-            best_score = score
-            best = chunk
-    return best
+
+    scored: list[dict[str, Any]] = []
+    for candidate in candidates:
+        chunk: SourceChunk = candidate["chunk"]
+        lexical_score = lexical_match_score(hint_text, chunk.text or "")
+        has_search_score = candidate.get("search_score") is not None
+        search_score = clamp_score(candidate.get("search_score")) if has_search_score else 0.0
+        if has_search_score:
+            search_weight = 0.7
+            lexical_weight = 0.3
+        else:
+            search_weight = 0.0
+            lexical_weight = 1.0
+        combined = search_weight * search_score + lexical_weight * lexical_score
+        rank_order = int(candidate["search_rank"]) if candidate.get("search_rank") is not None else 10**9
+
+        scored.append(
+            {
+                **candidate,
+                "rank_order": rank_order,
+                "selection_detail": {
+                    "version": "search_score_weighted_v1",
+                    "candidate_source": candidate.get("candidate_source", "run_chunks"),
+                    "combined_score": round(combined, 6),
+                    "search_score": round(search_score, 6) if has_search_score else None,
+                    "lexical_score": round(lexical_score, 6),
+                    "weights": {"search_score": search_weight, "lexical_score": lexical_weight},
+                    "search_rank": rank_order if rank_order < 10**9 else None,
+                },
+            }
+        )
+
+    scored.sort(
+        key=lambda row: (
+            -row["selection_detail"]["combined_score"],
+            -(row["selection_detail"]["search_score"] or 0.0),
+            -row["selection_detail"]["lexical_score"],
+            row["rank_order"],
+            row["chunk"].chunk_index,
+            str(row["chunk"].id),
+        )
+    )
+    return scored[0]
 
 
 @celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, retry_kwargs={"max_retries": 3})
@@ -880,17 +959,23 @@ def detect_change_spans(
 def derive_issues_from_changes(self, run_id: str) -> Dict[str, Any]:
     run_uuid = uuid.UUID(run_id)
     stage_name = "derive_issues_from_changes"
-    idempotency_key = stage_idempotency_key(
-        run_id=run_id,
-        stage_name=stage_name,
-        stage_input_fingerprint={"run_id": run_id},
-    )
 
     with session_scope() as db:
         get_run_or_raise(db, run_uuid)
+        diff_artifact = latest_artifact_by_kind(db, run_uuid, ArtifactKind.diff)
+        idempotency_key = stage_idempotency_key(
+            run_id=run_id,
+            stage_name=stage_name,
+            stage_input_fingerprint={
+                "diff_artifact_id": str(diff_artifact.id),
+                "diff_artifact_version": diff_artifact.version,
+                "diff_artifact_created_at": (
+                    diff_artifact.created_at.isoformat() if diff_artifact.created_at else None
+                ),
+            },
+        )
 
         def work() -> Dict[str, Any]:
-            diff_artifact = latest_artifact_by_kind(db, run_uuid, ArtifactKind.diff)
             payload = json.loads(diff_artifact.content_text or "{}")
             spans = payload.get("spans", [])
 
@@ -959,14 +1044,60 @@ def derive_issues_from_changes(self, run_id: str) -> Dict[str, Any]:
 def attach_evidence_to_issues(self, run_id: str, retry_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     run_uuid = uuid.UUID(run_id)
     stage_name = "attach_evidence_to_issues"
-    idempotency_key = stage_idempotency_key(
-        run_id=run_id,
-        stage_name=stage_name,
-        stage_input_fingerprint={"run_id": run_id},
-    )
 
     with session_scope() as db:
         get_run_or_raise(db, run_uuid)
+        issue_rows = (
+            db.query(Issue.id, Issue.fingerprint, Issue.status, Issue.updated_at)
+            .filter(Issue.run_id == run_uuid)
+            .order_by(Issue.id.asc())
+            .all()
+        )
+        chunk_rows_sig = (
+            db.query(SourceChunk.id, SourceChunk.source_doc_id, SourceChunk.chunk_index)
+            .join(SourceDoc, SourceChunk.source_doc_id == SourceDoc.id)
+            .filter(SourceDoc.run_id == run_uuid)
+            .order_by(SourceChunk.id.asc())
+            .all()
+        )
+        existing_evidence_rows = (
+            db.query(IssueEvidence.id, IssueEvidence.issue_id, IssueEvidence.citation_id)
+            .join(Issue, IssueEvidence.issue_id == Issue.id)
+            .filter(Issue.run_id == run_uuid)
+            .order_by(IssueEvidence.id.asc())
+            .all()
+        )
+        retry_search_ids = (retry_context or {}).get("retry_search_ids") or []
+        latest_retry_search_id = str(retry_search_ids[-1]) if retry_search_ids else None
+        latest_retry_search_uuid: uuid.UUID | None = None
+        if latest_retry_search_id:
+            try:
+                latest_retry_search_uuid = uuid.UUID(latest_retry_search_id)
+            except ValueError:
+                latest_retry_search_uuid = None
+        retry_search_result_rows = []
+        if latest_retry_search_uuid is not None:
+            retry_search_result_rows = (
+                db.query(SearchResult.chunk_id, SearchResult.rank, SearchResult.score)
+                .filter(SearchResult.search_id == latest_retry_search_uuid)
+                .order_by(SearchResult.rank.asc(), SearchResult.chunk_id.asc())
+                .all()
+            )
+        idempotency_key = stage_idempotency_key(
+            run_id=run_id,
+            stage_name=stage_name,
+            stage_input_fingerprint={
+                "issue_signature_hash": digest_rows(issue_rows),
+                "issue_count": len(issue_rows),
+                "source_chunk_signature_hash": digest_rows(chunk_rows_sig),
+                "source_chunk_count": len(chunk_rows_sig),
+                "existing_evidence_signature_hash": digest_rows(existing_evidence_rows),
+                "existing_evidence_count": len(existing_evidence_rows),
+                "latest_retry_search_id": latest_retry_search_id,
+                "latest_retry_search_result_signature_hash": digest_rows(retry_search_result_rows),
+                "latest_retry_search_result_count": len(retry_search_result_rows),
+            },
+        )
 
         def work() -> Dict[str, Any]:
             issues = (
@@ -975,15 +1106,44 @@ def attach_evidence_to_issues(self, run_id: str, retry_context: Optional[Dict[st
                 .order_by(Issue.severity.desc(), Issue.created_at.asc())
                 .all()
             )
-            chunks = (
-                db.query(SourceChunk, SourceDoc)
-                .join(SourceDoc, SourceChunk.source_doc_id == SourceDoc.id)
-                .filter(SourceDoc.run_id == run_uuid)
-                .order_by(SourceDoc.created_at.asc(), SourceChunk.chunk_index.asc())
-                .all()
-            )
-            chunk_rows = [row[0] for row in chunks]
-            chunk_doc_map = {row[0].id: row[1] for row in chunks}
+            preferred_search_id = latest_retry_search_id
+            if latest_retry_search_uuid is not None:
+                chunk_candidates = [
+                    {
+                        "chunk": chunk,
+                        "source_doc": source_doc,
+                        "search_score": score,
+                        "search_rank": rank,
+                        "candidate_source": "search_result",
+                    }
+                    for chunk, source_doc, score, rank in (
+                        db.query(SourceChunk, SourceDoc, SearchResult.score, SearchResult.rank)
+                        .join(SourceDoc, SourceChunk.source_doc_id == SourceDoc.id)
+                        .join(SearchResult, SearchResult.chunk_id == SourceChunk.id)
+                        .filter(SourceDoc.run_id == run_uuid, SearchResult.search_id == latest_retry_search_uuid)
+                        .order_by(SearchResult.rank.asc(), SourceChunk.id.asc())
+                        .all()
+                    )
+                ]
+            else:
+                chunk_candidates = []
+            if not chunk_candidates:
+                chunk_candidates = [
+                    {
+                        "chunk": chunk,
+                        "source_doc": source_doc,
+                        "search_score": None,
+                        "search_rank": None,
+                        "candidate_source": "run_chunks",
+                    }
+                    for chunk, source_doc in (
+                        db.query(SourceChunk, SourceDoc)
+                        .join(SourceDoc, SourceChunk.source_doc_id == SourceDoc.id)
+                        .filter(SourceDoc.run_id == run_uuid)
+                        .order_by(SourceDoc.created_at.asc(), SourceChunk.chunk_index.asc())
+                        .all()
+                    )
+                ]
             run = get_run_or_raise(db, run_uuid)
 
             attached = 0
@@ -998,13 +1158,14 @@ def attach_evidence_to_issues(self, run_id: str, retry_context: Optional[Dict[st
                 hint = f"{issue.title}\n{issue.summary}"
                 before_excerpt = issue.metadata_.get("before_excerpt", "")
                 after_excerpt = issue.metadata_.get("after_excerpt", "")
-                best_chunk = choose_best_chunk(chunk_rows, f"{hint}\n{before_excerpt}\n{after_excerpt}")
+                best = choose_best_chunk(chunk_candidates, f"{hint}\n{before_excerpt}\n{after_excerpt}")
+                best_chunk = best["chunk"] if best else None
                 if best_chunk is None or not best_chunk.loc:
                     issue.status = IssueStatus.hidden
                     hidden_issue_ids.append(str(issue.id))
                     continue
 
-                source_doc = chunk_doc_map.get(best_chunk.id)
+                source_doc = best.get("source_doc") if best else None
                 if source_doc is None:
                     issue.status = IssueStatus.hidden
                     hidden_issue_ids.append(str(issue.id))
@@ -1014,7 +1175,12 @@ def attach_evidence_to_issues(self, run_id: str, retry_context: Optional[Dict[st
                     feedback_id=None,
                     source_doc_id=source_doc.id,
                     chunk_id=best_chunk.id,
-                    span={"loc": best_chunk.loc, "scope": "issue"},
+                    span={
+                        "loc": best_chunk.loc,
+                        "scope": "issue",
+                        "selection": (best or {}).get("selection_detail"),
+                        "search_id": preferred_search_id,
+                    },
                 )
                 db.add(citation)
                 db.flush()
@@ -1041,7 +1207,7 @@ def attach_evidence_to_issues(self, run_id: str, retry_context: Optional[Dict[st
                     failure_detail={
                         "issue_total": issue_total,
                         "hidden_issue_ids": hidden_issue_ids,
-                        "source_chunk_count": len(chunk_rows),
+                        "source_chunk_count": len(chunk_candidates),
                         "retry_context": retry_context or {},
                     },
                 )
@@ -1054,6 +1220,8 @@ def attach_evidence_to_issues(self, run_id: str, retry_context: Optional[Dict[st
                 "issue_with_evidence_count": attached,
                 "issue_total": issue_total,
                 "hidden_issue_count": hidden_count,
+                "selection_strategy": "search_score_weighted_v1",
+                "selection_search_id": preferred_search_id,
                 "retry_context": retry_context or {},
             }
 
