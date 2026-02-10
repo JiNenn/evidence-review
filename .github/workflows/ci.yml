@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Python compile check
+        run: python -m compileall backend/app
+
+      - name: Frontend install
+        working-directory: frontend
+        run: npm ci
+
+      - name: Frontend build
+        working-directory: frontend
+        run: npm run build
+
+  acceptance:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        auth_mode: [off, on]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Prepare env
+        run: |
+          cp .env.example .env
+          if [ "${{ matrix.auth_mode }}" = "on" ]; then
+            sed -i 's/^AUTH_ENABLED=.*/AUTH_ENABLED=true/' .env
+          fi
+
+      - name: Build and start services
+        run: docker compose up -d --build
+
+      - name: Wait for API readiness
+        run: |
+          python - <<'PY'
+          import time, urllib.request, urllib.error
+          url = "http://localhost:8000/readyz"
+          deadline = time.time() + 120
+          while time.time() < deadline:
+              try:
+                  with urllib.request.urlopen(url, timeout=5) as r:
+                      if r.status == 200:
+                          print("ready")
+                          raise SystemExit(0)
+              except Exception:
+                  time.sleep(2)
+          raise SystemExit("API readiness timeout")
+          PY
+
+      - name: Acceptance smoke (auth off)
+        if: matrix.auth_mode == 'off'
+        run: python scripts/acceptance_smoke.py --api-base http://localhost:8000
+
+      - name: Acceptance smoke (auth on)
+        if: matrix.auth_mode == 'on'
+        run: python scripts/acceptance_smoke.py --api-base http://localhost:8000 --auth-user admin --auth-password admin
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Shutdown
+        if: always()
+        run: docker compose down -v
