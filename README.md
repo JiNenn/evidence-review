@@ -26,6 +26,7 @@ docker compose up --build
 - `acceptance`:
   - `AUTH_ENABLED=false` と `AUTH_ENABLED=true` の両方で
   - `scripts/acceptance_smoke.py` を実行
+  - 同一入力の別Runで issue-evidence 選定シグネチャが再現することも検証
 
 ## Endpoints
 

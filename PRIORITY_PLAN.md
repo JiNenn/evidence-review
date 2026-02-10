@@ -2,6 +2,13 @@
 
 Evidence-first UX を業務運用に近づけるための改修優先度を整理する。
 
+## 実装状況（最新）
+
+- 完了: P0-1 `selection` 明示返却（互換で `citation.span.selection` 併存）
+- 完了: P0-2 選定再現性の smoke 検証（同一入力の別Run比較）
+- 完了: P0-3 監査専用 API `/runs/{run_id}/audit/issues` 追加（互換維持）
+- 完了: P0-4 `blocked_evidence` の failure_detail に summary を追加
+
 ## P0: 直近で実装すべき
 
 1. Evidence 選定の説明データを API 契約として固定する  

@@ -6,6 +6,10 @@ import time
 import urllib.error
 import urllib.request
 
+NORMAL_TASK_PROMPT = "acceptance normal"
+NORMAL_SOURCE_FILENAME = "acceptance.txt"
+NORMAL_SOURCE_BODY = "この文書はレビュー論点抽出の根拠です。\n改善対象の差分を示します。"
+
 
 def http_json(
     method: str,
@@ -61,6 +65,13 @@ def assert_true(cond: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+def as_float(value, default: float = -1.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def auth_headers(api_base: str, auth_user: str | None, auth_password: str | None) -> dict:
     if not auth_user:
         return {}
@@ -72,11 +83,18 @@ def auth_headers(api_base: str, auth_user: str | None, auth_password: str | None
     return {"Authorization": f"Bearer {token['access_token']}"}
 
 
-def test_normal_and_compat(api_base: str, headers: dict) -> tuple[str, int]:
+def create_run_with_source_and_pipeline(
+    api_base: str,
+    headers: dict,
+    *,
+    task_prompt: str,
+    filename: str,
+    source_body: str,
+) -> str:
     run = http_json(
         "POST",
         f"{api_base}/runs",
-        {"task_prompt": "acceptance normal", "metadata": {"from": "script"}},
+        {"task_prompt": task_prompt, "metadata": {"from": "script", "kind": "repro"}},
         headers,
     )
     run_id = run["id"]
@@ -84,7 +102,100 @@ def test_normal_and_compat(api_base: str, headers: dict) -> tuple[str, int]:
     presign = http_json(
         "POST",
         f"{api_base}/runs/{run_id}/sources/presign-put",
-        {"filename": "acceptance.txt", "content_type": "text/plain"},
+        {"filename": filename, "content_type": "text/plain"},
+        headers,
+    )
+    http_put_bytes(
+        presign["url"],
+        source_body.encode("utf-8"),
+        "text/plain",
+    )
+    http_json(
+        "POST",
+        f"{api_base}/runs/{run_id}/sources/ingest",
+        {
+            "source_doc_id": presign["source_doc_id"],
+            "title": filename,
+            "content_type": "text/plain",
+        },
+        headers,
+    )
+    time.sleep(2)
+    http_json("POST", f"{api_base}/runs/{run_id}/pipeline", {}, headers)
+    poll(lambda: http_json("GET", f"{api_base}/runs/{run_id}/issues", None, headers), timeout_sec=40)
+    return run_id
+
+
+def extract_selection_signature(issue_detail: dict) -> dict:
+    evidences = issue_detail.get("evidences", [])
+    assert_true(len(evidences) >= 1, "issue detail should include evidences for signature")
+
+    def score_tuple(evidence: dict):
+        selection = evidence.get("selection")
+        if not isinstance(selection, dict):
+            citation_span = evidence.get("citation_span") or {}
+            selection = citation_span.get("selection") if isinstance(citation_span, dict) else {}
+        if not isinstance(selection, dict):
+            selection = {}
+        return (
+            as_float(selection.get("combined_score"), -1.0),
+            as_float(selection.get("search_score"), -1.0),
+            as_float(selection.get("lexical_score"), -1.0),
+            -as_float(selection.get("search_rank"), 10**9),
+            evidence.get("id", ""),
+        )
+
+    best = sorted(evidences, key=score_tuple, reverse=True)[0]
+    selection = best.get("selection")
+    if not isinstance(selection, dict):
+        citation_span = best.get("citation_span") or {}
+        selection = citation_span.get("selection") if isinstance(citation_span, dict) else {}
+    if not isinstance(selection, dict):
+        selection = {}
+
+    return {
+        "chunk_text": best.get("chunk_text", ""),
+        "combined_score": round(as_float(selection.get("combined_score"), -1.0), 6),
+        "search_score": round(as_float(selection.get("search_score"), -1.0), 6),
+        "lexical_score": round(as_float(selection.get("lexical_score"), -1.0), 6),
+        "selection_version": selection.get("version"),
+    }
+
+
+def collect_run_selection_signature(api_base: str, headers: dict, run_id: str) -> list[dict]:
+    issues = http_json("GET", f"{api_base}/runs/{run_id}/issues", None, headers)
+    assert_true(isinstance(issues, list), "issues endpoint should return list")
+    signature_rows = []
+    sorted_issues = sorted(
+        issues,
+        key=lambda row: (row.get("title", ""), row.get("summary", ""), int(row.get("severity", 0))),
+    )
+    for issue in sorted_issues:
+        detail = http_json("GET", f"{api_base}/issues/{issue['id']}", None, headers)
+        signature_rows.append(
+            {
+                "title": issue.get("title", ""),
+                "summary": issue.get("summary", ""),
+                "severity": issue.get("severity", 0),
+                **extract_selection_signature(detail),
+            }
+        )
+    return signature_rows
+
+
+def test_normal_and_compat(api_base: str, headers: dict) -> tuple[str, int, str]:
+    run = http_json(
+        "POST",
+        f"{api_base}/runs",
+        {"task_prompt": NORMAL_TASK_PROMPT, "metadata": {"from": "script"}},
+        headers,
+    )
+    run_id = run["id"]
+
+    presign = http_json(
+        "POST",
+        f"{api_base}/runs/{run_id}/sources/presign-put",
+        {"filename": NORMAL_SOURCE_FILENAME, "content_type": "text/plain"},
         headers,
     )
     assert_true("source_doc_id" in presign, "presign response should include source_doc_id")
@@ -101,7 +212,7 @@ def test_normal_and_compat(api_base: str, headers: dict) -> tuple[str, int]:
     )
     http_put_bytes(
         presign["url"],
-        "この文書はレビュー論点抽出の根拠です。\n改善対象の差分を示します。".encode("utf-8"),
+        NORMAL_SOURCE_BODY.encode("utf-8"),
         "text/plain",
     )
 
@@ -110,7 +221,7 @@ def test_normal_and_compat(api_base: str, headers: dict) -> tuple[str, int]:
         f"{api_base}/runs/{run_id}/sources/ingest",
         {
             "source_doc_id": presign["source_doc_id"],
-            "title": "acceptance.txt",
+            "title": NORMAL_SOURCE_FILENAME,
             "content_type": "text/plain",
         },
         headers,
@@ -193,7 +304,22 @@ def test_normal_and_compat(api_base: str, headers: dict) -> tuple[str, int]:
         run_row.get("status") in {"success", "success_partial"},
         "run status should be success or success_partial in normal flow",
     )
-    return run_id, len(issues)
+
+    # reproducibility: same input on a fresh run should produce same issue-evidence selection signatures
+    baseline_signature = collect_run_selection_signature(api_base, headers, run_id)
+    repro_run_id = create_run_with_source_and_pipeline(
+        api_base,
+        headers,
+        task_prompt=NORMAL_TASK_PROMPT,
+        filename=NORMAL_SOURCE_FILENAME,
+        source_body=NORMAL_SOURCE_BODY,
+    )
+    repro_signature = collect_run_selection_signature(api_base, headers, repro_run_id)
+    assert_true(
+        repro_signature == baseline_signature,
+        "selection signature should be reproducible for the same input",
+    )
+    return run_id, len(issues), repro_run_id
 
 
 def test_failure_stage_record(api_base: str, headers: dict) -> str:
@@ -231,6 +357,15 @@ def test_failure_stage_record(api_base: str, headers: dict) -> str:
         bool(failed[0].get("failure_detail")),
         "failed stage should include failure_detail",
     )
+    failure_detail = failed[0].get("failure_detail") or {}
+    assert_true(
+        failure_detail.get("required") == "source_chunk",
+        "failure detail should include required input for blocked_evidence",
+    )
+    assert_true(
+        bool(failure_detail.get("summary")),
+        "failure detail should include summary for operator readability",
+    )
     run_row = http_json("GET", f"{api_base}/runs/{run_id}", None, headers)
     assert_true(
         run_row.get("status") == "blocked_evidence",
@@ -248,7 +383,7 @@ def main() -> int:
 
     try:
         headers = auth_headers(args.api_base, args.auth_user, args.auth_password)
-        run_id, issue_count = test_normal_and_compat(args.api_base, headers)
+        run_id, issue_count, repro_run_id = test_normal_and_compat(args.api_base, headers)
         failure_run_id = test_failure_stage_record(args.api_base, headers)
     except (AssertionError, TimeoutError, urllib.error.URLError) as exc:
         print(f"[FAIL] {exc}")
@@ -257,6 +392,8 @@ def main() -> int:
     print("[OK] issues normal flow")
     print(f"  run_id={run_id} issues={issue_count}")
     print("[OK] compatibility endpoints")
+    print("[OK] selection reproducibility")
+    print(f"  repro_run_id={repro_run_id}")
     print("[OK] failure stage persistence")
     print(f"  failure_run_id={failure_run_id}")
     return 0

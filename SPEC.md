@@ -347,6 +347,8 @@
   2回目：`keyword` + relaxed filters（`min_score>=0.0`, `top_k=100`）
   3回目：`vector` + fallback filters（`min_score>=0.0`, `top_k=120`）
 * 各再試行で発行した `search_request_id` と条件差分は `run_stages.failure_detail` に記録する
+* `run_stages.failure_detail` には運用者向け `summary` を必須で含め、
+  `hidden_reason_counts` 等の集約情報で一目で原因把握できる形にする
 * 再試行を使い切っても不足する場合のみ `blocked_evidence` で確定する
 
 ---

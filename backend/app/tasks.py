@@ -559,7 +559,11 @@ def generate_feedback_with_citations(self, run_id: str, target_artifact_id: str)
                 raise StageFailureError(
                     "no source chunk found for citation-backed feedback",
                     failure_type=StageFailureType.evidence_insufficient,
-                    failure_detail={"run_id": str(run_uuid), "required": "source_chunk"},
+                    failure_detail={
+                        "run_id": str(run_uuid),
+                        "required": "source_chunk",
+                        "summary": "source chunk is required before citation-backed feedback can run",
+                    },
                 )
 
             source_chunk, source_doc = chunk
@@ -586,7 +590,10 @@ def generate_feedback_with_citations(self, run_id: str, target_artifact_id: str)
                 raise StageFailureError(
                     "feedback must include at least one citation",
                     failure_type=StageFailureType.evidence_insufficient,
-                    failure_detail={"feedback_id": str(feedback.id)},
+                    failure_detail={
+                        "feedback_id": str(feedback.id),
+                        "summary": "feedback generation completed without any citation",
+                    },
                 )
 
             return {"feedback_id": str(feedback.id), "citation_count": citation_count}
@@ -1148,6 +1155,14 @@ def attach_evidence_to_issues(self, run_id: str, retry_context: Optional[Dict[st
 
             attached = 0
             hidden_issue_ids: list[str] = []
+            hidden_reason_counts: dict[str, int] = {}
+            hidden_issue_reasons: list[dict[str, str]] = []
+
+            def record_hidden(issue_id: uuid.UUID, reason: str) -> None:
+                hidden_issue_ids.append(str(issue_id))
+                hidden_reason_counts[reason] = hidden_reason_counts.get(reason, 0) + 1
+                hidden_issue_reasons.append({"issue_id": str(issue_id), "reason": reason})
+
             for issue in issues:
                 existing = db.query(IssueEvidence).filter(IssueEvidence.issue_id == issue.id).count()
                 if existing > 0:
@@ -1160,15 +1175,19 @@ def attach_evidence_to_issues(self, run_id: str, retry_context: Optional[Dict[st
                 after_excerpt = issue.metadata_.get("after_excerpt", "")
                 best = choose_best_chunk(chunk_candidates, f"{hint}\n{before_excerpt}\n{after_excerpt}")
                 best_chunk = best["chunk"] if best else None
-                if best_chunk is None or not best_chunk.loc:
+                if best_chunk is None:
                     issue.status = IssueStatus.hidden
-                    hidden_issue_ids.append(str(issue.id))
+                    record_hidden(issue.id, "no_candidate_chunk")
+                    continue
+                if not best_chunk.loc:
+                    issue.status = IssueStatus.hidden
+                    record_hidden(issue.id, "missing_chunk_loc")
                     continue
 
                 source_doc = best.get("source_doc") if best else None
                 if source_doc is None:
                     issue.status = IssueStatus.hidden
-                    hidden_issue_ids.append(str(issue.id))
+                    record_hidden(issue.id, "missing_source_doc")
                     continue
 
                 citation = Citation(
@@ -1201,13 +1220,23 @@ def attach_evidence_to_issues(self, run_id: str, retry_context: Optional[Dict[st
             if issue_total == 0:
                 run.status = RunStatus.success
             elif attached == 0:
+                summary = (
+                    "all issues hidden after evidence attachment: "
+                    f"issue_total={issue_total}, hidden_count={hidden_count}, "
+                    f"reason_counts={hidden_reason_counts}, search_id={preferred_search_id or '-'}"
+                )
                 raise StageFailureError(
                     "all issues are hidden because evidence attachment failed",
                     failure_type=StageFailureType.evidence_insufficient,
                     failure_detail={
+                        "summary": summary,
                         "issue_total": issue_total,
                         "hidden_issue_ids": hidden_issue_ids,
+                        "hidden_issue_reasons": hidden_issue_reasons[:50],
+                        "hidden_reason_counts": hidden_reason_counts,
                         "source_chunk_count": len(chunk_candidates),
+                        "selection_strategy": "search_score_weighted_v1",
+                        "selection_search_id": preferred_search_id,
                         "retry_context": retry_context or {},
                     },
                 )
@@ -1220,6 +1249,7 @@ def attach_evidence_to_issues(self, run_id: str, retry_context: Optional[Dict[st
                 "issue_with_evidence_count": attached,
                 "issue_total": issue_total,
                 "hidden_issue_count": hidden_count,
+                "hidden_reason_counts": hidden_reason_counts,
                 "selection_strategy": "search_score_weighted_v1",
                 "selection_search_id": preferred_search_id,
                 "retry_context": retry_context or {},
