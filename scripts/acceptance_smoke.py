@@ -38,6 +38,13 @@ def http_put_bytes(url: str, payload: bytes, content_type: str) -> None:
         return
 
 
+def http_get_status(url: str) -> int:
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        _ = resp.read(1)
+        return int(resp.status)
+
+
 def poll(fn, timeout_sec: int = 30, interval_sec: float = 1.0):
     started = time.time()
     while True:
@@ -80,6 +87,18 @@ def test_normal_and_compat(api_base: str, headers: dict) -> tuple[str, int]:
         {"filename": "acceptance.txt", "content_type": "text/plain"},
         headers,
     )
+    assert_true("source_doc_id" in presign, "presign response should include source_doc_id")
+    assert_true(str(presign["source_doc_id"]) in presign["object_key"], "object key should include source_doc_id")
+    presigned_source = http_json(
+        "GET",
+        f"{api_base}/sources/{presign['source_doc_id']}/presign-get",
+        None,
+        headers,
+    )
+    assert_true(
+        presigned_source.get("object_key") == presign["object_key"],
+        "source_doc should exist at presign stage and keep same object_key",
+    )
     http_put_bytes(
         presign["url"],
         "この文書はレビュー論点抽出の根拠です。\n改善対象の差分を示します。".encode("utf-8"),
@@ -89,7 +108,11 @@ def test_normal_and_compat(api_base: str, headers: dict) -> tuple[str, int]:
     http_json(
         "POST",
         f"{api_base}/runs/{run_id}/sources/ingest",
-        {"object_key": presign["object_key"], "title": "acceptance.txt", "content_type": "text/plain"},
+        {
+            "source_doc_id": presign["source_doc_id"],
+            "title": "acceptance.txt",
+            "content_type": "text/plain",
+        },
         headers,
     )
     time.sleep(2)
@@ -98,14 +121,57 @@ def test_normal_and_compat(api_base: str, headers: dict) -> tuple[str, int]:
     issues = poll(lambda: http_json("GET", f"{api_base}/runs/{run_id}/issues", None, headers), timeout_sec=40)
     assert_true(isinstance(issues, list) and len(issues) > 0, "issues should exist")
     assert_true(all(issue.get("evidence_count", 0) >= 1 for issue in issues), "all issues must have evidence")
+    assert_true(all(issue.get("status") != "hidden" for issue in issues), "hidden issues must not be listed")
+    issues_all = http_json("GET", f"{api_base}/runs/{run_id}/issues?include_hidden=true", None, headers)
+    assert_true(isinstance(issues_all, list), "issues include_hidden should return list")
+    assert_true(len(issues_all) >= len(issues), "include_hidden should return at least as many issues")
 
-    issue_detail = http_json("GET", f"{api_base}/issues/{issues[0]['id']}", None, headers)
-    assert_true(len(issue_detail.get("evidences", [])) >= 1, "issue detail should include evidences")
+    checked_source_docs: set[str] = set()
+    for issue in issues:
+        issue_detail = http_json("GET", f"{api_base}/issues/{issue['id']}", None, headers)
+        evidences = issue_detail.get("evidences", [])
+        assert_true(len(evidences) >= 1, "issue detail should include evidences")
+
+        for evidence in evidences:
+            assert_true(bool(evidence.get("loc")), "evidence loc must exist")
+            assert_true(bool(evidence.get("chunk_loc")), "evidence chunk_loc must exist")
+            assert_true(bool(evidence.get("source_doc_id")), "evidence source_doc_id must exist")
+            assert_true(bool(evidence.get("chunk_id")), "evidence chunk_id must exist")
+            if evidence.get("citation_span") is not None:
+                assert_true(isinstance(evidence.get("citation_span"), dict), "citation_span must be an object")
+
+            citation = http_json("GET", f"{api_base}/citations/{evidence['citation_id']}", None, headers)
+            assert_true(citation.get("source_doc_id") == evidence.get("source_doc_id"), "citation source_doc mismatch")
+            assert_true(citation.get("chunk_id") == evidence.get("chunk_id"), "citation chunk mismatch")
+            if citation.get("span") is not None:
+                assert_true(isinstance(citation.get("span"), dict), "citation span must be an object")
+
+            source_doc_id = citation["source_doc_id"]
+            if source_doc_id not in checked_source_docs:
+                source_get = http_json("GET", f"{api_base}/sources/{source_doc_id}/presign-get", None, headers)
+                assert_true(http_get_status(source_get["url"]) == 200, "presigned source GET should return 200")
+                checked_source_docs.add(source_doc_id)
 
     artifacts = http_json("GET", f"{api_base}/runs/{run_id}/artifacts", None, headers)
     feedback = http_json("GET", f"{api_base}/runs/{run_id}/feedback", None, headers)
     assert_true(isinstance(artifacts, list), "artifacts endpoint should be compatible")
     assert_true(isinstance(feedback, list), "feedback endpoint should be compatible")
+    artifact_count_before = len(artifacts)
+
+    # idempotency: same input rerun should not create duplicated artifacts
+    http_json("POST", f"{api_base}/runs/{run_id}/pipeline", {}, headers)
+    time.sleep(2)
+    artifacts_after = http_json("GET", f"{api_base}/runs/{run_id}/artifacts", None, headers)
+    assert_true(
+        len(artifacts_after) == artifact_count_before,
+        "rerun with same input should not increase artifact count",
+    )
+
+    run_row = http_json("GET", f"{api_base}/runs/{run_id}", None, headers)
+    assert_true(
+        run_row.get("status") in {"success", "success_partial"},
+        "run status should be success or success_partial in normal flow",
+    )
     return run_id, len(issues)
 
 
@@ -136,6 +202,19 @@ def test_failure_stage_record(api_base: str, headers: dict) -> str:
     ]
     assert_true(len(failed) == 1, "failed stage should be persisted for missing source case")
     assert_true(bool((failed[0].get("output_ref") or {}).get("error")), "failed stage should contain error message")
+    assert_true(
+        failed[0].get("failure_type") == "evidence_insufficient",
+        "failed stage should be classified as evidence_insufficient",
+    )
+    assert_true(
+        bool(failed[0].get("failure_detail")),
+        "failed stage should include failure_detail",
+    )
+    run_row = http_json("GET", f"{api_base}/runs/{run_id}", None, headers)
+    assert_true(
+        run_row.get("status") == "blocked_evidence",
+        "run status should become blocked_evidence when evidence cannot be attached",
+    )
     return run_id
 
 

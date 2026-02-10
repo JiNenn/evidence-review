@@ -2,11 +2,12 @@ import hashlib
 import json
 import re
 import uuid
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, List
 
 import redis
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -29,8 +30,9 @@ from app.models import (
     SearchStatus,
     SourceChunk,
     SourceDoc,
+    SourceOrigin,
 )
-from app.s3_client import ensure_bucket_exists, get_s3_client, presign_get, presign_put
+from app.s3_client import ensure_bucket_exists, get_s3_client, object_exists, presign_get, presign_put
 from app.schemas import (
     ArtifactResponse,
     AuthTokenRequest,
@@ -77,10 +79,45 @@ def search_idempotency_key(run_id: uuid.UUID, query: str, filters: Dict[str, Any
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def build_object_key(run_id: uuid.UUID, filename: str) -> str:
+def normalize_run_status_for_api(status_value):
+    if getattr(status_value, "value", None) == "failed":
+        return "failed_legacy"
+    return status_value
+
+
+def build_object_key(run_id: uuid.UUID, source_doc_id: uuid.UUID, filename: str) -> str:
     safe = Path(filename).name
-    source_doc_id = uuid.uuid4()
     return f"runs/{run_id}/sources/{source_doc_id}/raw/{safe}"
+
+
+def cleanup_orphan_source_docs(db: Session) -> int:
+    """
+    Remove stale source_docs created by presign but never uploaded/ingested.
+    """
+    cutoff = tasks.now_utc() - timedelta(hours=settings.source_doc_orphan_ttl_hours)
+    candidates = (
+        db.query(SourceDoc)
+        .outerjoin(SourceChunk, SourceChunk.source_doc_id == SourceDoc.id)
+        .filter(SourceChunk.id.is_(None), SourceDoc.created_at < cutoff)
+        .all()
+    )
+    removed = 0
+    for source_doc in candidates:
+        if not object_exists(source_doc.object_key):
+            db.delete(source_doc)
+            removed += 1
+    if removed > 0:
+        db.flush()
+    return removed
+
+
+def ensure_audit_visibility_allowed(include_hidden: bool, subject: str) -> None:
+    if not include_hidden:
+        return
+    if not settings.auth_enabled:
+        return
+    if subject != settings.auth_dev_user:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="include_hidden requires audit privilege")
 
 
 def to_issue_evidence_response(db: Session, evidence: IssueEvidence) -> IssueEvidenceResponse | None:
@@ -91,13 +128,17 @@ def to_issue_evidence_response(db: Session, evidence: IssueEvidence) -> IssueEvi
     chunk = db.get(SourceChunk, citation.chunk_id)
     if source_doc is None or chunk is None:
         return None
+    resolved_loc = chunk.loc or evidence.loc or {}
     return IssueEvidenceResponse(
         id=evidence.id,
         issue_id=evidence.issue_id,
         citation_id=evidence.citation_id,
+        source_doc_id=citation.source_doc_id,
+        chunk_id=citation.chunk_id,
+        citation_span=citation.span,
         before_excerpt=evidence.before_excerpt,
         after_excerpt=evidence.after_excerpt,
-        loc=evidence.loc,
+        loc=resolved_loc,
         source_title=source_doc.title,
         source_presigned_url=presign_get(source_doc.object_key),
         chunk_text=chunk.text,
@@ -158,7 +199,7 @@ def create_run(
         id=run.id,
         created_at=run.created_at,
         task_prompt=run.task_prompt,
-        status=run.status,
+        status=normalize_run_status_for_api(run.status),
         metadata=run.metadata_,
     )
 
@@ -176,7 +217,7 @@ def get_run(
         id=run.id,
         created_at=run.created_at,
         task_prompt=run.task_prompt,
-        status=run.status,
+        status=normalize_run_status_for_api(run.status),
         metadata=run.metadata_,
     )
 
@@ -186,14 +227,14 @@ def list_run_stages(
     run_id: uuid.UUID,
     db: Session = Depends(get_db),
     _subject: str = Depends(require_auth),
-) -> List[RunStage]:
+) -> List[RunStageResponse]:
     run = db.get(Run, run_id)
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
     return (
         db.query(RunStage)
         .filter(RunStage.run_id == run_id)
-        .order_by(RunStage.stage_name.asc())
+        .order_by(RunStage.started_at.asc().nullslast(), RunStage.stage_name.asc(), RunStage.attempt.asc())
         .all()
     )
 
@@ -218,9 +259,11 @@ def list_artifacts(
 @app.get("/runs/{run_id}/issues", response_model=List[IssueResponse])
 def list_issues(
     run_id: uuid.UUID,
+    include_hidden: bool = Query(default=False),
     db: Session = Depends(get_db),
-    _subject: str = Depends(require_auth),
+    subject: str = Depends(require_auth),
 ) -> List[IssueResponse]:
+    ensure_audit_visibility_allowed(include_hidden, subject)
     run = db.get(Run, run_id)
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
@@ -235,7 +278,9 @@ def list_issues(
     rows: List[IssueResponse] = []
     for issue in issues:
         evidence_count = len(issue.evidences)
-        if evidence_count < 1:
+        if not include_hidden and issue.status.value == "hidden":
+            continue
+        if not include_hidden and evidence_count < 1:
             continue
         rows.append(
             IssueResponse(
@@ -319,10 +364,27 @@ def presign_source_upload(
     run = db.get(Run, run_id)
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
+    cleanup_orphan_source_docs(db)
 
-    object_key = build_object_key(run_id, payload.filename)
+    source_doc_id = uuid.uuid4()
+    object_key = build_object_key(run_id, source_doc_id, payload.filename)
+    source_doc = SourceDoc(
+        id=source_doc_id,
+        run_id=run_id,
+        title=Path(payload.filename).name,
+        origin=SourceOrigin.upload,
+        object_key=object_key,
+        content_type=payload.content_type,
+    )
     url = presign_put(object_key, payload.content_type)
-    return PresignPutResponse(object_key=object_key, url=url, headers={"Content-Type": payload.content_type})
+    db.add(source_doc)
+    db.commit()
+    return PresignPutResponse(
+        source_doc_id=source_doc_id,
+        object_key=object_key,
+        url=url,
+        headers={"Content-Type": payload.content_type},
+    )
 
 
 @app.post("/runs/{run_id}/sources/ingest", response_model=IngestResponse)
@@ -336,19 +398,37 @@ def ingest_source(
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
 
-    title = payload.title or Path(payload.object_key).name
-    source_doc = SourceDoc(
-        run_id=run_id,
-        title=title,
-        origin=payload.origin,
-        object_key=payload.object_key,
-        content_type=payload.content_type,
-    )
-    db.add(source_doc)
+    source_doc = db.get(SourceDoc, payload.source_doc_id)
+    if source_doc is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="source_doc not found")
+    if source_doc.run_id != run_id:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="source_doc belongs to another run")
+
+    if payload.title is not None:
+        source_doc.title = payload.title
+    if payload.origin is not None:
+        source_doc.origin = payload.origin
+    if payload.object_key is not None:
+        source_doc.object_key = payload.object_key
+    if payload.content_type is not None:
+        source_doc.content_type = payload.content_type
+
+    if not object_exists(source_doc.object_key):
+        db.delete(source_doc)
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="source object not found; source_doc removed as orphan",
+        )
+
     db.commit()
     db.refresh(source_doc)
 
-    task = tasks.ingest_source_doc.delay(str(run_id), payload.object_key, str(source_doc.id))
+    task = tasks.ingest_source_doc.delay(
+        str(run_id),
+        source_doc_id=str(source_doc.id),
+        object_key=source_doc.object_key,
+    )
     return IngestResponse(source_doc_id=source_doc.id, task_id=task.id)
 
 

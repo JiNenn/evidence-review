@@ -4,7 +4,17 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from app.models import ArtifactFormat, ArtifactKind, IssueStatus, RunStatus, SearchMode, SearchStatus, StageStatus
+from app.models import (
+    ArtifactFormat,
+    ArtifactKind,
+    IssueStatus,
+    RunStatus,
+    SearchMode,
+    SearchStatus,
+    SourceOrigin,
+    StageFailureType,
+    StageStatus,
+)
 
 
 class RunCreate(BaseModel):
@@ -89,6 +99,9 @@ class IssueEvidenceResponse(BaseModel):
     id: uuid.UUID
     issue_id: uuid.UUID
     citation_id: uuid.UUID
+    source_doc_id: uuid.UUID
+    chunk_id: uuid.UUID
+    citation_span: Optional[Dict[str, Any]]
     before_excerpt: Optional[str]
     after_excerpt: Optional[str]
     loc: Dict[str, Any]
@@ -130,6 +143,7 @@ class PresignPutRequest(BaseModel):
 
 
 class PresignPutResponse(BaseModel):
+    source_doc_id: uuid.UUID
     object_key: str
     url: str
     method: str = "PUT"
@@ -137,10 +151,11 @@ class PresignPutResponse(BaseModel):
 
 
 class IngestRequest(BaseModel):
-    object_key: str
+    source_doc_id: uuid.UUID
+    object_key: Optional[str] = None
     title: Optional[str] = None
-    content_type: str = "application/octet-stream"
-    origin: str = "upload"
+    content_type: Optional[str] = None
+    origin: Optional[SourceOrigin] = None
 
 
 class IngestResponse(BaseModel):
@@ -205,6 +220,8 @@ class StageResponse(BaseModel):
 class RunStageResponse(BaseModel):
     stage_name: str
     status: StageStatus
+    failure_type: Optional[StageFailureType]
+    failure_detail: Optional[Dict[str, Any]]
     attempt: int
     started_at: Optional[datetime]
     finished_at: Optional[datetime]

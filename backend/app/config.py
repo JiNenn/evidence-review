@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     s3_secret_key: str = "minioadmin"
     s3_bucket: str = "diffui"
     s3_presign_expires: int = 900
+    source_doc_orphan_ttl_hours: int = 24
 
     jwt_secret: str = "replace-with-strong-secret"
     jwt_expires_in: int = 3600

@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 from celery.utils.log import get_task_logger
 from pypdf import PdfReader
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 
 from app.celery_app import celery_app
 from app.config import get_settings
@@ -27,16 +28,19 @@ from app.models import (
     Run,
     RunStatus,
     SearchRequest,
+    SearchMode,
     SearchResult,
     SearchStatus,
     SourceChunk,
     SourceDoc,
+    StageFailureType,
 )
 from app.s3_client import get_object_bytes, put_object_bytes
-from app.stage import execute_stage
+from app.stage import StageFailureError, execute_stage
 
 logger = get_task_logger(__name__)
 settings = get_settings()
+PROMPT_TEMPLATE_VERSION = "v1"
 
 
 def now_utc() -> datetime:
@@ -46,6 +50,24 @@ def now_utc() -> datetime:
 def hash_key(*values: Any) -> str:
     raw = "|".join(json.dumps(value, sort_keys=True, default=str) for value in values)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def stage_idempotency_key(
+    *,
+    run_id: str,
+    stage_name: str,
+    stage_input_fingerprint: Dict[str, Any] | None = None,
+    model_cfg: Dict[str, Any] | None = None,
+    prompt_template_version: str = PROMPT_TEMPLATE_VERSION,
+) -> str:
+    payload = {
+        "run_id": run_id,
+        "stage_name": stage_name,
+        "stage_input_fingerprint": stage_input_fingerprint or {},
+        "prompt_template_version": prompt_template_version,
+        "model_cfg": model_cfg or {},
+    }
+    return hash_key(payload)
 
 
 def decode_text(raw: bytes) -> str:
@@ -169,6 +191,11 @@ def excerpt(text: str, limit: int = 220) -> str:
     return cleaned[:limit]
 
 
+def normalize_fingerprint_text(text: str) -> str:
+    cleaned = " ".join((text or "").lower().split())
+    return cleaned[:512]
+
+
 def tokens(text: str) -> set[str]:
     return set(re.findall(r"\w+", (text or "").lower()))
 
@@ -195,26 +222,29 @@ def choose_best_chunk(chunks: list[SourceChunk], hint_text: str) -> SourceChunk 
 def ingest_source_doc(
     self,
     run_id: str,
+    source_doc_id: str,
     object_key: Optional[str] = None,
-    source_doc_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     run_uuid = uuid.UUID(run_id)
-    source_doc_uuid = uuid.UUID(source_doc_id) if source_doc_id else None
+    source_doc_uuid = uuid.UUID(source_doc_id)
     stage_name = "ingest_source_doc"
-    idempotency_key = hash_key(stage_name, run_id, object_key, source_doc_id)
+    idempotency_key = stage_idempotency_key(
+        run_id=run_id,
+        stage_name=stage_name,
+        stage_input_fingerprint={"source_doc_id": source_doc_id, "object_key": object_key or ""},
+    )
 
     with session_scope() as db:
         get_run_or_raise(db, run_uuid)
 
         def work() -> Dict[str, Any]:
-            query = db.query(SourceDoc).filter(SourceDoc.run_id == run_uuid)
-            if source_doc_uuid:
-                query = query.filter(SourceDoc.id == source_doc_uuid)
-            elif object_key:
-                query = query.filter(SourceDoc.object_key == object_key)
-            source_doc = query.first()
+            source_doc = db.get(SourceDoc, source_doc_uuid)
             if source_doc is None:
                 raise ValueError("source_doc not found for ingest")
+            if source_doc.run_id != run_uuid:
+                raise ValueError("source_doc does not belong to run")
+            if object_key and source_doc.object_key != object_key:
+                source_doc.object_key = object_key
 
             db.query(SourceChunk).filter(SourceChunk.source_doc_id == source_doc.id).delete()
 
@@ -264,7 +294,12 @@ def ingest_source_doc(
 def generate_low_draft(self, run_id: str, model_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     run_uuid = uuid.UUID(run_id)
     stage_name = "generate_low_draft"
-    idempotency_key = hash_key(stage_name, run_id, model_cfg or {})
+    idempotency_key = stage_idempotency_key(
+        run_id=run_id,
+        stage_name=stage_name,
+        stage_input_fingerprint={"task": "low_draft"},
+        model_cfg=model_cfg or {},
+    )
 
     with session_scope() as db:
         run = get_run_or_raise(db, run_uuid)
@@ -303,7 +338,16 @@ def search_chunks(
 ) -> Dict[str, Any]:
     run_uuid = uuid.UUID(run_id)
     stage_name = "search_chunks"
-    idempotency_key = hash_key(stage_name, run_id, query, filters or {}, mode, search_id)
+    idempotency_key = stage_idempotency_key(
+        run_id=run_id,
+        stage_name=stage_name,
+        stage_input_fingerprint={
+            "query": query.strip(),
+            "filters": filters or {},
+            "mode": mode,
+            "search_id": search_id,
+        },
+    )
 
     with session_scope() as db:
         get_run_or_raise(db, run_uuid)
@@ -312,6 +356,18 @@ def search_chunks(
             search_req = db.get(SearchRequest, uuid.UUID(search_id)) if search_id else None
             if search_req:
                 search_req.status = SearchStatus.running
+
+            filter_payload = filters or {}
+            try:
+                top_k = int(filter_payload.get("top_k", 50))
+            except (TypeError, ValueError):
+                top_k = 50
+            top_k = max(1, min(top_k, 200))
+            try:
+                min_score = float(filter_payload.get("min_score", 0.0))
+            except (TypeError, ValueError):
+                min_score = 0.0
+            min_score = max(0.0, min(min_score, 1.0))
 
             q = query.strip()
             if not q:
@@ -355,7 +411,7 @@ def search_chunks(
                 else:
                     score = 0.1 if q.lower() in text.lower() else 0.0
 
-                if score > 0:
+                if score > min_score:
                     scored.append(
                         {
                             "source_doc_id": source_doc.id,
@@ -369,7 +425,7 @@ def search_chunks(
             scored.sort(key=lambda item: item["score"], reverse=True)
             if search_req:
                 db.query(SearchResult).filter(SearchResult.search_id == search_req.id).delete()
-                for rank, item in enumerate(scored[:50], start=1):
+                for rank, item in enumerate(scored[:top_k], start=1):
                     db.add(
                         SearchResult(
                             search_id=search_req.id,
@@ -383,7 +439,7 @@ def search_chunks(
                     )
                 search_req.status = SearchStatus.success
 
-            return {"result_count": len(scored[:50])}
+            return {"result_count": len(scored[:top_k]), "top_k": top_k, "min_score": min_score}
 
         return execute_stage(
             db,
@@ -399,7 +455,11 @@ def generate_feedback_with_citations(self, run_id: str, target_artifact_id: str)
     run_uuid = uuid.UUID(run_id)
     target_uuid = uuid.UUID(target_artifact_id)
     stage_name = "generate_feedback_with_citations"
-    idempotency_key = hash_key(stage_name, run_id, target_artifact_id)
+    idempotency_key = stage_idempotency_key(
+        run_id=run_id,
+        stage_name=stage_name,
+        stage_input_fingerprint={"target_artifact_id": target_artifact_id},
+    )
 
     with session_scope() as db:
         get_run_or_raise(db, run_uuid)
@@ -417,7 +477,11 @@ def generate_feedback_with_citations(self, run_id: str, target_artifact_id: str)
                 .first()
             )
             if chunk is None:
-                raise RuntimeError("no source chunk found for citation-backed feedback")
+                raise StageFailureError(
+                    "no source chunk found for citation-backed feedback",
+                    failure_type=StageFailureType.evidence_insufficient,
+                    failure_detail={"run_id": str(run_uuid), "required": "source_chunk"},
+                )
 
             source_chunk, source_doc = chunk
             feedback = FeedbackItem(
@@ -433,14 +497,18 @@ def generate_feedback_with_citations(self, run_id: str, target_artifact_id: str)
                 feedback_id=feedback.id,
                 source_doc_id=source_doc.id,
                 chunk_id=source_chunk.id,
-                span={"line": source_chunk.loc.get("line")},
+                span={"loc": source_chunk.loc, "scope": "feedback"},
             )
             db.add(citation)
             db.flush()
 
             citation_count = db.query(Citation).filter(Citation.feedback_id == feedback.id).count()
             if citation_count < 1:
-                raise RuntimeError("feedback must include at least one citation")
+                raise StageFailureError(
+                    "feedback must include at least one citation",
+                    failure_type=StageFailureType.evidence_insufficient,
+                    failure_detail={"feedback_id": str(feedback.id)},
+                )
 
             return {"feedback_id": str(feedback.id), "citation_count": citation_count}
 
@@ -458,7 +526,11 @@ def apply_feedback(self, run_id: str, base_artifact_id: str) -> Dict[str, Any]:
     run_uuid = uuid.UUID(run_id)
     base_uuid = uuid.UUID(base_artifact_id)
     stage_name = "apply_feedback"
-    idempotency_key = hash_key(stage_name, run_id, base_artifact_id)
+    idempotency_key = stage_idempotency_key(
+        run_id=run_id,
+        stage_name=stage_name,
+        stage_input_fingerprint={"base_artifact_id": base_artifact_id},
+    )
 
     with session_scope() as db:
         get_run_or_raise(db, run_uuid)
@@ -497,7 +569,12 @@ def apply_feedback(self, run_id: str, base_artifact_id: str) -> Dict[str, Any]:
 def generate_high_final(self, run_id: str, model_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     run_uuid = uuid.UUID(run_id)
     stage_name = "generate_high_final"
-    idempotency_key = hash_key(stage_name, run_id, model_cfg or {})
+    idempotency_key = stage_idempotency_key(
+        run_id=run_id,
+        stage_name=stage_name,
+        stage_input_fingerprint={"task": "high_final"},
+        model_cfg=model_cfg or {},
+    )
 
     with session_scope() as db:
         run = get_run_or_raise(db, run_uuid)
@@ -520,7 +597,7 @@ def generate_high_final(self, run_id: str, model_cfg: Optional[Dict[str, Any]] =
                     f"{body}\n\n## Final polish\n- Added concise summary.\n"
                 ),
             )
-            run.status = RunStatus.success
+            run.status = RunStatus.running
             return {"artifact_id": str(artifact.id)}
 
         return execute_stage(
@@ -557,7 +634,11 @@ def block_diff(a_text: str, b_text: str) -> List[Dict[str, Any]]:
 def build_diffs(self, run_id: str, artifact_ids: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     run_uuid = uuid.UUID(run_id)
     stage_name = "build_diffs"
-    idempotency_key = hash_key(stage_name, run_id, artifact_ids or {})
+    idempotency_key = stage_idempotency_key(
+        run_id=run_id,
+        stage_name=stage_name,
+        stage_input_fingerprint={"artifact_ids": artifact_ids or {}},
+    )
 
     with session_scope() as db:
         get_run_or_raise(db, run_uuid)
@@ -628,7 +709,74 @@ def run_full_pipeline(self, run_id: str, model_low: Optional[str] = None, model_
         },
     )
     issue_result = derive_issues_from_changes.run(run_id)
-    evidence_result = attach_evidence_to_issues.run(run_id)
+    run_uuid = uuid.UUID(run_id)
+    with session_scope() as db:
+        run = get_run_or_raise(db, run_uuid)
+        retry_query = (run.task_prompt or "").strip() or "evidence"
+
+    # Retry strategy for evidence不足:
+    # 1) keyword + strict filters
+    # 2) keyword + relaxed filters + larger top_k
+    evidence_retry_plan = [
+        {"attempt": 1, "mode": "keyword", "filters": {"strategy": "strict", "top_k": 50, "min_score": 0.02}},
+        {"attempt": 2, "mode": "keyword", "filters": {"strategy": "relaxed", "top_k": 100, "min_score": 0.0}},
+        {"attempt": 3, "mode": "vector", "filters": {"strategy": "vector_fallback", "top_k": 120, "min_score": 0.0}},
+    ]
+    retry_search_ids: list[str] = []
+    evidence_retry_count = 0
+    while True:
+        retry_context = {
+            "retry_attempt": evidence_retry_count,
+            "retry_search_ids": retry_search_ids,
+        }
+        try:
+            evidence_result = attach_evidence_to_issues.run(run_id, retry_context=retry_context)
+            break
+        except StageFailureError as exc:
+            if exc.failure_type != StageFailureType.evidence_insufficient:
+                raise
+            if evidence_retry_count >= len(evidence_retry_plan):
+                raise StageFailureError(
+                    str(exc),
+                    failure_type=StageFailureType.evidence_insufficient,
+                    failure_detail={
+                        **(exc.failure_detail or {}),
+                        "retry_search_ids": retry_search_ids,
+                        "retry_strategy": [row["filters"] for row in evidence_retry_plan],
+                        "retry_exhausted": True,
+                    },
+                ) from exc
+
+            step = evidence_retry_plan[evidence_retry_count]
+            evidence_retry_count += 1
+
+            with session_scope() as db:
+                search_key = hash_key("evidence_retry_search", run_id, step, retry_query[:256])
+                search_req = SearchRequest(
+                    run_id=run_uuid,
+                    query=retry_query[:256],
+                    filters=step["filters"],
+                    mode=SearchMode(step["mode"]),
+                    status=SearchStatus.pending,
+                    idempotency_key=search_key,
+                )
+                try:
+                    db.add(search_req)
+                    db.flush()
+                except IntegrityError:
+                    db.rollback()
+                    search_req = db.query(SearchRequest).filter(SearchRequest.idempotency_key == search_key).one()
+
+                search_id = str(search_req.id)
+
+            search_chunks.run(
+                run_id,
+                query=retry_query[:256],
+                filters=step["filters"],
+                mode=step["mode"],
+                search_id=search_id,
+            )
+            retry_search_ids.append(search_id)
 
     return {
         "low_artifact_id": low_artifact_id,
@@ -638,6 +786,8 @@ def run_full_pipeline(self, run_id: str, model_low: Optional[str] = None, model_
         "diff_artifact_id": span_result["artifact_id"],
         "issue_count": issue_result["issue_count"],
         "issue_with_evidence_count": evidence_result["issue_with_evidence_count"],
+        "evidence_retry_count": evidence_retry_count,
+        "evidence_retry_search_ids": retry_search_ids,
     }
 
 
@@ -649,7 +799,11 @@ def detect_change_spans(
 ) -> Dict[str, Any]:
     run_uuid = uuid.UUID(run_id)
     stage_name = "detect_change_spans"
-    idempotency_key = hash_key(stage_name, run_id, artifact_ids or {})
+    idempotency_key = stage_idempotency_key(
+        run_id=run_id,
+        stage_name=stage_name,
+        stage_input_fingerprint={"artifact_ids": artifact_ids or {}},
+    )
 
     with session_scope() as db:
         get_run_or_raise(db, run_uuid)
@@ -726,7 +880,11 @@ def detect_change_spans(
 def derive_issues_from_changes(self, run_id: str) -> Dict[str, Any]:
     run_uuid = uuid.UUID(run_id)
     stage_name = "derive_issues_from_changes"
-    idempotency_key = hash_key(stage_name, run_id)
+    idempotency_key = stage_idempotency_key(
+        run_id=run_id,
+        stage_name=stage_name,
+        stage_input_fingerprint={"run_id": run_id},
+    )
 
     with session_scope() as db:
         get_run_or_raise(db, run_uuid)
@@ -752,7 +910,14 @@ def derive_issues_from_changes(self, run_id: str) -> Dict[str, Any]:
                 summary = f"{title_prefix}: {after_excerpt or before_excerpt}"
                 severity = 3 if status in {"modified", "removed"} else 2
                 confidence = min(0.99, max(0.4, float(span.get("score", 0.5))))
-                fingerprint = hash_key(run_id, span.get("span_id"), before_excerpt, after_excerpt, status)
+                phase = span.get("phase", "")
+                fingerprint = hash_key(
+                    "issue-fingerprint-v2",
+                    phase,
+                    status,
+                    normalize_fingerprint_text(before_excerpt),
+                    normalize_fingerprint_text(after_excerpt),
+                )
 
                 db.add(
                     Issue(
@@ -769,6 +934,11 @@ def derive_issues_from_changes(self, run_id: str) -> Dict[str, Any]:
                             "status": status,
                             "before_excerpt": before_excerpt,
                             "after_excerpt": after_excerpt,
+                            "fingerprint_basis": {
+                                "version": "v2",
+                                "phase": phase,
+                                "status": status,
+                            },
                         },
                     )
                 )
@@ -786,10 +956,14 @@ def derive_issues_from_changes(self, run_id: str) -> Dict[str, Any]:
 
 
 @celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, retry_kwargs={"max_retries": 3})
-def attach_evidence_to_issues(self, run_id: str) -> Dict[str, Any]:
+def attach_evidence_to_issues(self, run_id: str, retry_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     run_uuid = uuid.UUID(run_id)
     stage_name = "attach_evidence_to_issues"
-    idempotency_key = hash_key(stage_name, run_id)
+    idempotency_key = stage_idempotency_key(
+        run_id=run_id,
+        stage_name=stage_name,
+        stage_input_fingerprint={"run_id": run_id},
+    )
 
     with session_scope() as db:
         get_run_or_raise(db, run_uuid)
@@ -810,28 +984,30 @@ def attach_evidence_to_issues(self, run_id: str) -> Dict[str, Any]:
             )
             chunk_rows = [row[0] for row in chunks]
             chunk_doc_map = {row[0].id: row[1] for row in chunks}
+            run = get_run_or_raise(db, run_uuid)
 
             attached = 0
+            hidden_issue_ids: list[str] = []
             for issue in issues:
                 existing = db.query(IssueEvidence).filter(IssueEvidence.issue_id == issue.id).count()
                 if existing > 0:
+                    issue.status = IssueStatus.open
                     attached += 1
                     continue
 
                 hint = f"{issue.title}\n{issue.summary}"
                 before_excerpt = issue.metadata_.get("before_excerpt", "")
                 after_excerpt = issue.metadata_.get("after_excerpt", "")
-                if issue.metadata_:
-                    before_excerpt = issue.metadata_.get("before_excerpt", "")
-                    after_excerpt = issue.metadata_.get("after_excerpt", "")
                 best_chunk = choose_best_chunk(chunk_rows, f"{hint}\n{before_excerpt}\n{after_excerpt}")
-                if best_chunk is None:
+                if best_chunk is None or not best_chunk.loc:
                     issue.status = IssueStatus.hidden
+                    hidden_issue_ids.append(str(issue.id))
                     continue
 
                 source_doc = chunk_doc_map.get(best_chunk.id)
                 if source_doc is None:
                     issue.status = IssueStatus.hidden
+                    hidden_issue_ids.append(str(issue.id))
                     continue
 
                 citation = Citation(
@@ -854,7 +1030,32 @@ def attach_evidence_to_issues(self, run_id: str) -> Dict[str, Any]:
                 issue.status = IssueStatus.open
                 attached += 1
 
-            return {"issue_with_evidence_count": attached, "issue_total": len(issues)}
+            issue_total = len(issues)
+            hidden_count = len(hidden_issue_ids)
+            if issue_total == 0:
+                run.status = RunStatus.success
+            elif attached == 0:
+                raise StageFailureError(
+                    "all issues are hidden because evidence attachment failed",
+                    failure_type=StageFailureType.evidence_insufficient,
+                    failure_detail={
+                        "issue_total": issue_total,
+                        "hidden_issue_ids": hidden_issue_ids,
+                        "source_chunk_count": len(chunk_rows),
+                        "retry_context": retry_context or {},
+                    },
+                )
+            elif attached < issue_total:
+                run.status = RunStatus.success_partial
+            else:
+                run.status = RunStatus.success
+
+            return {
+                "issue_with_evidence_count": attached,
+                "issue_total": issue_total,
+                "hidden_issue_count": hidden_count,
+                "retry_context": retry_context or {},
+            }
 
         return execute_stage(
             db,

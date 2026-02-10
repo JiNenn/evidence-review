@@ -11,6 +11,11 @@ export default function HomePage() {
   const [runId, setRunId] = useState("");
   const [issues, setIssues] = useState([]);
   const [issueDetails, setIssueDetails] = useState({});
+  const [includeHidden, setIncludeHidden] = useState(false);
+  const [stages, setStages] = useState([]);
+  const [sourceDocs, setSourceDocs] = useState([]);
+  const [sourceFile, setSourceFile] = useState(null);
+  const [fileInputKey, setFileInputKey] = useState(0);
   const [loadingIssueId, setLoadingIssueId] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -57,8 +62,35 @@ export default function HomePage() {
   };
 
   const refreshIssues = async (id) => {
-    const rows = await callApi(`/runs/${id}/issues`);
+    const query = includeHidden ? "?include_hidden=true" : "";
+    const rows = await callApi(`/runs/${id}/issues${query}`);
     setIssues(rows);
+  };
+
+  const refreshStages = async (id) => {
+    const rows = await callApi(`/runs/${id}/stages`);
+    setStages(rows);
+    return rows;
+  };
+
+  const waitPipeline = async (id) => {
+    const maxPoll = 60;
+    for (let i = 0; i < maxPoll; i += 1) {
+      const rows = await refreshStages(id);
+      const failed = rows.find((row) => row.status === "failed");
+      if (failed) {
+        const reason = failed.output_ref?.error || "unknown error";
+        throw new Error(`stage failed: ${failed.stage_name} / ${reason}`);
+      }
+      const done = rows.find(
+        (row) => row.stage_name === "attach_evidence_to_issues" && row.status === "success"
+      );
+      if (done) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    throw new Error("pipeline timeout");
   };
 
   const createRun = async () => {
@@ -71,7 +103,71 @@ export default function HomePage() {
       });
       setRunId(run.id);
       setIssues([]);
+      setStages([]);
+      setSourceDocs([]);
+      setSourceFile(null);
+      setFileInputKey((prev) => prev + 1);
       setIssueDetails({});
+    } catch (e) {
+      setError(String(e.message || e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const uploadSource = async () => {
+    if (!runId) {
+      setError("先に Run を作成してください。");
+      return;
+    }
+    if (!sourceFile) {
+      setError("アップロードするファイルを選択してください。");
+      return;
+    }
+
+    setBusy(true);
+    setError("");
+    try {
+      const contentType = sourceFile.type || "application/octet-stream";
+      const presign = await callApi(`/runs/${runId}/sources/presign-put`, {
+        method: "POST",
+        body: JSON.stringify({
+          filename: sourceFile.name,
+          content_type: contentType
+        })
+      });
+
+      const putResp = await fetch(presign.url, {
+        method: "PUT",
+        headers: {
+          "Content-Type": contentType
+        },
+        body: sourceFile
+      });
+      if (!putResp.ok) {
+        const text = await putResp.text();
+        throw new Error(`upload failed: ${putResp.status} ${text}`);
+      }
+
+      const ingest = await callApi(`/runs/${runId}/sources/ingest`, {
+        method: "POST",
+        body: JSON.stringify({
+          source_doc_id: presign.source_doc_id,
+          object_key: presign.object_key,
+          title: sourceFile.name,
+          content_type: contentType
+        })
+      });
+
+      setSourceDocs((prev) => [
+        ...prev,
+        {
+          id: ingest.source_doc_id,
+          title: sourceFile.name
+        }
+      ]);
+      setSourceFile(null);
+      setFileInputKey((prev) => prev + 1);
     } catch (e) {
       setError(String(e.message || e));
     } finally {
@@ -84,6 +180,10 @@ export default function HomePage() {
       setError("先に Run を作成してください。");
       return;
     }
+    if (sourceDocs.length < 1) {
+      setError("先に少なくとも1件のソースを取り込んでください。");
+      return;
+    }
     setBusy(true);
     setError("");
     try {
@@ -91,6 +191,7 @@ export default function HomePage() {
         method: "POST",
         body: JSON.stringify({})
       });
+      await waitPipeline(runId);
       await refreshIssues(runId);
     } catch (e) {
       setError(String(e.message || e));
@@ -107,6 +208,7 @@ export default function HomePage() {
     setError("");
     try {
       await refreshIssues(runId);
+      await refreshStages(runId);
     } catch (e) {
       setError(String(e.message || e));
     } finally {
@@ -168,12 +270,66 @@ export default function HomePage() {
         <div className="mono">
           <span className="chip">API: {API_BASE}</span>
           <span className="chip">run_id: {runId || "-"}</span>
+          <span className="chip">sources: {sourceDocs.length}</span>
           <span className="chip">issues: {issues.length}</span>
+          <span className="chip">stages: {stages.length}</span>
         </div>
+        <label className="mono">
+          <input
+            type="checkbox"
+            checked={includeHidden}
+            onChange={(e) => setIncludeHidden(e.target.checked)}
+            style={{ marginRight: 6 }}
+          />
+          hidden issue を含めて取得
+        </label>
         {error ? <p className="mono" style={{ color: "#b12704" }}>{error}</p> : null}
       </section>
 
       <section className="grid" style={{ marginTop: 16 }}>
+        <article className="panel">
+          <h2>Sources</h2>
+          <div className="row">
+            <input
+              key={fileInputKey}
+              type="file"
+              onChange={(e) => setSourceFile(e.target.files && e.target.files[0] ? e.target.files[0] : null)}
+            />
+            <button className="secondary" onClick={uploadSource} disabled={busy || !runId || !sourceFile}>
+              アップロードして取り込み
+            </button>
+          </div>
+          {sourceDocs.length === 0 ? (
+            <p className="mono">取り込み済みソースはまだありません。</p>
+          ) : (
+            sourceDocs.map((doc) => (
+              <p className="mono" key={doc.id}>
+                {doc.id} / {doc.title}
+              </p>
+            ))
+          )}
+        </article>
+
+        <article className="panel">
+          <h2>Stages</h2>
+          {stages.length === 0 ? (
+            <p className="mono">stage情報はまだありません。</p>
+          ) : (
+            stages.map((stage) => (
+              <div key={stage.stage_name} className="panel" style={{ marginTop: 10 }}>
+                <p className="mono">
+                  {stage.stage_name} / status={stage.status} / attempt={stage.attempt}
+                </p>
+                {stage.failure_type ? <p className="mono">failure_type: {stage.failure_type}</p> : null}
+                {stage.failure_detail ? (
+                  <pre>{JSON.stringify(stage.failure_detail, null, 2)}</pre>
+                ) : null}
+                {stage.output_ref?.error ? <p className="mono">error: {stage.output_ref.error}</p> : null}
+              </div>
+            ))
+          )}
+        </article>
+
         <article className="panel">
           <h2>Issues</h2>
           {issues.length === 0 ? (

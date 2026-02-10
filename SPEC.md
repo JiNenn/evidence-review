@@ -80,10 +80,17 @@
 ### 4.1 ソース取り込み（Evidence基盤の構築）
 
 1. frontend → api：アップロード準備要求（ファイル名/Content-Type等）
-2. api → frontend：MinIOの **presigned PUT URL** を返す
-3. browser → minio：ファイルを直接アップロード
-4. api → worker：`ingest_source_doc(run_id, object_key)` を投入
-5. worker：抽出→チャンク化→（必要に応じて埋め込み）→DBへ保存
+2. api：`source_docs` を先に作成し、`source_doc_id` を発行
+3. api → frontend：MinIOの **presigned PUT URL** と `source_doc_id` / `object_key` を返す
+4. browser → minio：ファイルを直接アップロード
+5. frontend → api：`source_doc_id` 指定で ingest 要求
+6. api → worker：`ingest_source_doc(run_id, source_doc_id)` を投入
+7. worker：抽出→チャンク化→（必要に応じて埋め込み）→DBへ保存
+
+**補足**
+
+* `object_key` は `runs/{run_id}/sources/{source_doc_id}/raw/{filename}` を必須規約とする
+* ingest は `source_doc_id` を主キーとして扱い、`object_key` は `source_docs` から参照する
 
 ### 4.2 生成パイプライン（Issue抽出主導）
 
@@ -119,8 +126,13 @@
   * `id (uuid)`
   * `created_at`
   * `task_prompt (text)`
-  * `status (enum)`
+  * `status (enum: pending, running, success, success_partial, blocked_evidence, failed_system, failed_legacy)`
   * `metadata (jsonb)`
+
+**運用規約**
+
+* 旧値 `failed` は移行時に `failed_legacy` へ正規化し、APIは `failed` を返さない
+* 失敗詳細は `run_stages.failure_type / failure_detail` を正とする
 
 ### 5.2 Artifact（成果物）
 
@@ -157,7 +169,7 @@
   * `before_excerpt (text, nullable)`
   * `after_excerpt (text, nullable)`
   * `citation_id (fk)` ※原文到達可能な根拠
-  * `loc (jsonb)`
+  * `loc (jsonb, optional)` ※キャッシュ用loc（参照元の正本は `source_chunks.loc`）
 
 * `citations`（共通根拠）
 
@@ -165,11 +177,14 @@
   * `feedback_id (fk, nullable)` ※従来FBとの互換のためnullable
   * `source_doc_id (fk)`
   * `chunk_id (fk)`
-  * `span (jsonb, optional)`
+  * `span (jsonb, optional)` ※ハイライト情報。欠けても `loc` があれば可
 
 **制約（重要）**
 
 * `issues` は **issue_evidences が1件以上** あるものだけを UI表示対象とする。
+* `fingerprint` は同趣旨Issueの安定キーとして、最低限 `change_type + phase + 正規化before/after要約` を入力に含める
+  （Evidence解決結果 `source_doc_id/chunk_id` は含めない）
+* loc解決の優先順位は `source_chunks.loc` を正本とし、`issue_evidences.loc` はキャッシュとして扱う
 
 ### 5.4 SourceDoc / SourceChunk（ソースとチャンク）
 
@@ -201,14 +216,18 @@
   * `stage_name (text)`
   * `idempotency_key (text)`
   * `status (enum: pending, running, success, failed)`
+  * `failure_type (enum: system_error, evidence_insufficient, validation_error, nullable)`
+  * `failure_detail (jsonb, nullable)` ※関連IDや再試行判断用の情報
   * `attempt (int)`
   * `started_at` / `finished_at`
   * `output_ref (jsonb)` ※作成artifact_id等
 
 **制約（重要）**
 
-* UNIQUE `(run_id, stage_name)` または `(idempotency_key)`
+* UNIQUE `(idempotency_key)` を正とする
 * Workerは開始時に「既にsuccessなら即return」する。
+* `stage_name` は分類用であり、同一 `run_id` 内で複数行を許容する（入力が異なる再実行を許可）
+* `attempt` は **同一 `idempotency_key` に対する試行回数** とする（再試行は同一行を更新）
 
 ### 5.6 SearchRequest / SearchResult（探索の永続化）
 
@@ -255,15 +274,17 @@
   * `GET /runs/{run_id}`（run取得）
   * `GET /runs/{run_id}/stages`（stage状態/失敗理由の取得）
   * `GET /runs/{run_id}/issues`（主導API）
+  * `GET /runs/{run_id}/issues?include_hidden=true`（監査/デバッグ用、権限制御あり）
   * `GET /issues/{issue_id}`（論点詳細 + 根拠）
   * `GET /runs/{run_id}/artifacts`（デバッグ用途）
   * `GET /runs/{run_id}/feedback`（互換用途）
 
 * Source Upload
 
-  * `POST /runs/{run_id}/sources/presign-put`（presigned PUT発行）
-  * `POST /runs/{run_id}/sources/ingest`（object_key登録→worker投入）
+  * `POST /runs/{run_id}/sources/presign-put`（presigned PUT発行 + `source_doc_id/object_key` 返却）
+  * `POST /runs/{run_id}/sources/ingest`（`source_doc_id` 指定でworker投入）
   * `GET /sources/{source_doc_id}/presign-get`
+  * presignのみで放置された `source_docs` はTTL超過後に自動クリーンアップ
 
 * Pipeline
 
@@ -285,7 +306,7 @@
 
 ### 7.1 ジョブ一覧（v0.1）
 
-* `ingest_source_doc(run_id, object_key)`
+* `ingest_source_doc(run_id, source_doc_id)`
 * `generate_low_draft(run_id, model_cfg)`
 * `search_chunks(run_id, query, filters, mode)`
 * `generate_feedback_with_citations(run_id, target_artifact_id)`
@@ -300,6 +321,10 @@
 * すべてのジョブは `run_stages` により冪等制御
 * 外部API/LLM呼び出しはリトライ戦略（指数バックオフ + 最大回数）
 * 成果物は **先にDBで「このstageの成果はこれ」** を確定してから書き込む（重複を防ぐ）
+* 冪等判定は `idempotency_key` を正とし、同一 `stage_name` の多版実行を許容する
+* `idempotency_key` の最低構成は
+  `hash(run_id + stage_name + stage_input_fingerprint + prompt_template_version + model_cfg)` とする
+* `stage_input_fingerprint` は stage入力実体（artifact_id/version, source_doc_id, search条件など）を正規化して含める
 
 ### 7.3 Evidence-first（論点表示条件）
 
@@ -307,7 +332,16 @@
 
   * UI表示対象 issue ごとに `issue_evidences >= 1`
   * issue_evidence が参照する citation の chunk が実在し、`loc` で原文へ戻れる
+  * `span` は任意（存在する場合のみ妥当性チェック）
 * 根拠を付与できない issue は `hidden` 扱いとし、UI表示しない
+* 根拠不足により全 issue が hidden になる場合は `run.status=blocked_evidence` とし、
+  `run_stages.failure_type=evidence_insufficient` を記録する
+* `evidence_insufficient` の再試行戦略（既定3回）は次で固定する
+  1回目：`keyword` + strict filters（`min_score>=0.02`, `top_k=50`）
+  2回目：`keyword` + relaxed filters（`min_score>=0.0`, `top_k=100`）
+  3回目：`vector` + fallback filters（`min_score>=0.0`, `top_k=120`）
+* 各再試行で発行した `search_request_id` と条件差分は `run_stages.failure_detail` に記録する
+* 再試行を使い切っても不足する場合のみ `blocked_evidence` で確定する
 
 ---
 
@@ -372,6 +406,7 @@
 * `DATABASE_URL`
 * `REDIS_URL`
 * `S3_ENDPOINT, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET`
+* `SOURCE_DOC_ORPHAN_TTL_HOURS`
 * `JWT_SECRET, JWT_EXPIRES_IN`
 * `AUTH_ENABLED, AUTH_DEV_USER, AUTH_DEV_PASSWORD`
 * `LLM_PROVIDER, LLM_API_KEY, MODEL_HIGH, MODEL_LOW`（キーはSecrets扱い）
@@ -402,3 +437,14 @@
 2. パイプラインのステージ表（stage_name / input / output / idempotency_key）
 3. APIのOpenAPI草案（`issues` 主導のリクエスト/レスポンススキーマ）
 4. compose雛形（サービス、ヘルスチェック、migrateの実行方式）
+
+---
+
+## 15. 受け入れ契約（最低ライン）
+
+* `GET /runs/{run_id}/issues` は `issue_evidences>=1` の Issue のみ返す
+* 各 evidence は `citation_id` から `(source_doc_id, chunk_id, loc)` に到達できる
+* `include_hidden=true` のときのみ hidden Issue を取得できる
+* 全Issueがhiddenになった場合は `run.status=blocked_evidence` かつ対応stageに
+  `failure_type=evidence_insufficient` が残る
+* 同一入力の再実行では成果物が増殖せず、`idempotency_key` により再利用される
