@@ -125,6 +125,9 @@ def test_normal_and_compat(api_base: str, headers: dict) -> tuple[str, int]:
     issues_all = http_json("GET", f"{api_base}/runs/{run_id}/issues?include_hidden=true", None, headers)
     assert_true(isinstance(issues_all, list), "issues include_hidden should return list")
     assert_true(len(issues_all) >= len(issues), "include_hidden should return at least as many issues")
+    issues_audit = http_json("GET", f"{api_base}/runs/{run_id}/audit/issues", None, headers)
+    assert_true(isinstance(issues_audit, list), "audit issues endpoint should return list")
+    assert_true(len(issues_audit) >= len(issues), "audit issues should return at least as many issues")
 
     checked_source_docs: set[str] = set()
     for issue in issues:
@@ -149,6 +152,7 @@ def test_normal_and_compat(api_base: str, headers: dict) -> tuple[str, int]:
             if citation.get("feedback_id") is None:
                 span = citation.get("span") or {}
                 selection = span.get("selection")
+                assert_true(bool(evidence.get("selection")), "issue evidence should include explicit selection")
                 assert_true(bool(selection), "issue citation span should include selection detail")
                 assert_true(
                     selection.get("version") == "search_score_weighted_v1",
@@ -157,6 +161,10 @@ def test_normal_and_compat(api_base: str, headers: dict) -> tuple[str, int]:
                 assert_true(
                     isinstance(selection.get("combined_score"), (int, float)),
                     "issue citation selection should include combined_score",
+                )
+                assert_true(
+                    evidence.get("selection", {}).get("version") == selection.get("version"),
+                    "issue evidence selection should match citation span selection",
                 )
 
             source_doc_id = citation["source_doc_id"]

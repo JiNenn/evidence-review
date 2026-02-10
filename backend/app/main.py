@@ -120,6 +120,44 @@ def ensure_audit_visibility_allowed(include_hidden: bool, subject: str) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="include_hidden requires audit privilege")
 
 
+def build_issue_rows(
+    db: Session,
+    run_id: uuid.UUID,
+    *,
+    include_hidden: bool,
+    include_zero_evidence: bool,
+) -> List[IssueResponse]:
+    issues = (
+        db.query(Issue)
+        .options(joinedload(Issue.evidences))
+        .filter(Issue.run_id == run_id)
+        .order_by(Issue.severity.desc(), Issue.created_at.asc())
+        .all()
+    )
+    rows: List[IssueResponse] = []
+    for issue in issues:
+        evidence_count = len(issue.evidences)
+        if not include_hidden and issue.status.value == "hidden":
+            continue
+        if not include_zero_evidence and evidence_count < 1:
+            continue
+        rows.append(
+            IssueResponse(
+                id=issue.id,
+                run_id=issue.run_id,
+                title=issue.title,
+                summary=issue.summary,
+                severity=issue.severity,
+                confidence=issue.confidence,
+                status=issue.status,
+                evidence_count=evidence_count,
+                created_at=issue.created_at,
+                updated_at=issue.updated_at,
+            )
+        )
+    return rows
+
+
 def to_issue_evidence_response(db: Session, evidence: IssueEvidence) -> IssueEvidenceResponse | None:
     citation = db.get(Citation, evidence.citation_id)
     if citation is None:
@@ -129,6 +167,11 @@ def to_issue_evidence_response(db: Session, evidence: IssueEvidence) -> IssueEvi
     if source_doc is None or chunk is None:
         return None
     resolved_loc = chunk.loc or evidence.loc or {}
+    selection = None
+    if isinstance(citation.span, dict):
+        candidate = citation.span.get("selection")
+        if isinstance(candidate, dict):
+            selection = candidate
     return IssueEvidenceResponse(
         id=evidence.id,
         issue_id=evidence.issue_id,
@@ -136,6 +179,7 @@ def to_issue_evidence_response(db: Session, evidence: IssueEvidence) -> IssueEvi
         source_doc_id=citation.source_doc_id,
         chunk_id=citation.chunk_id,
         citation_span=citation.span,
+        selection=selection,
         before_excerpt=evidence.before_excerpt,
         after_excerpt=evidence.after_excerpt,
         loc=resolved_loc,
@@ -268,35 +312,20 @@ def list_issues(
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
 
-    issues = (
-        db.query(Issue)
-        .options(joinedload(Issue.evidences))
-        .filter(Issue.run_id == run_id)
-        .order_by(Issue.severity.desc(), Issue.created_at.asc())
-        .all()
-    )
-    rows: List[IssueResponse] = []
-    for issue in issues:
-        evidence_count = len(issue.evidences)
-        if not include_hidden and issue.status.value == "hidden":
-            continue
-        if not include_hidden and evidence_count < 1:
-            continue
-        rows.append(
-            IssueResponse(
-                id=issue.id,
-                run_id=issue.run_id,
-                title=issue.title,
-                summary=issue.summary,
-                severity=issue.severity,
-                confidence=issue.confidence,
-                status=issue.status,
-                evidence_count=evidence_count,
-                created_at=issue.created_at,
-                updated_at=issue.updated_at,
-            )
-        )
-    return rows
+    return build_issue_rows(db, run_id, include_hidden=include_hidden, include_zero_evidence=include_hidden)
+
+
+@app.get("/runs/{run_id}/audit/issues", response_model=List[IssueResponse])
+def list_audit_issues(
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    subject: str = Depends(require_auth),
+) -> List[IssueResponse]:
+    ensure_audit_visibility_allowed(True, subject)
+    run = db.get(Run, run_id)
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
+    return build_issue_rows(db, run_id, include_hidden=True, include_zero_evidence=True)
 
 
 @app.get("/issues/{issue_id}", response_model=IssueDetailResponse)

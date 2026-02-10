@@ -275,6 +275,7 @@
   * `GET /runs/{run_id}/stages`（stage状態/失敗理由の取得）
   * `GET /runs/{run_id}/issues`（主導API）
   * `GET /runs/{run_id}/issues?include_hidden=true`（監査/デバッグ用、権限制御あり）
+  * `GET /runs/{run_id}/audit/issues`（監査UI向け、hidden含む）
   * `GET /issues/{issue_id}`（論点詳細 + 根拠）
   * `GET /runs/{run_id}/artifacts`（デバッグ用途）
   * `GET /runs/{run_id}/feedback`（互換用途）
@@ -332,6 +333,8 @@
 
   * UI表示対象 issue ごとに `issue_evidences >= 1`
   * issue_evidence が参照する citation の chunk が実在し、`loc` で原文へ戻れる
+  * `GET /issues/{issue_id}` は evidence ごとに明示 `selection` を返す
+    （互換期間は `citation.span.selection` も併存）
   * 根拠候補の選定は `SearchResult.score` を主（重み0.7）に、論点テキストとの lexical一致度（重み0.3）を合成した
     `combined_score` で決定する（SearchResultが無い場合は lexical一致度のみ）
   * 同点時は `search_rank -> chunk_index -> chunk_id` で決定し、再実行時の再現性を担保する

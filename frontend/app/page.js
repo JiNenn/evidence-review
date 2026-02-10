@@ -9,9 +9,9 @@ const DEFAULT_AUTH_PASSWORD = process.env.NEXT_PUBLIC_AUTH_DEV_PASSWORD || "admi
 export default function HomePage() {
   const [taskPrompt, setTaskPrompt] = useState("根拠付きでレビュー論点を抽出してください。");
   const [runId, setRunId] = useState("");
+  const [runStatus, setRunStatus] = useState("");
   const [issues, setIssues] = useState([]);
   const [issueDetails, setIssueDetails] = useState({});
-  const [includeHidden, setIncludeHidden] = useState(false);
   const [stages, setStages] = useState([]);
   const [sourceDocs, setSourceDocs] = useState([]);
   const [sourceFile, setSourceFile] = useState(null);
@@ -70,6 +70,33 @@ export default function HomePage() {
     });
   };
 
+  const severityLabel = (severity) => {
+    const value = toNumberOr(severity, 0);
+    if (value >= 3) {
+      return "high";
+    }
+    if (value >= 2) {
+      return "medium";
+    }
+    return "low";
+  };
+
+  const issuesEmptyMessage = () => {
+    if (!runId) {
+      return "表示可能な論点はまだありません。";
+    }
+    if (runStatus === "success") {
+      return "内容がほとんど一致しています。";
+    }
+    if (runStatus === "blocked_evidence") {
+      return "根拠不足のため論点を確定できませんでした。Run単位の復旧は Debug 画面を使ってください。";
+    }
+    if (runStatus === "running" || runStatus === "pending") {
+      return "処理中です。完了後に論点が表示されます。";
+    }
+    return "表示可能な論点はまだありません。";
+  };
+
   const callApi = async (path, options = {}) => {
     const headers = {
       "Content-Type": "application/json",
@@ -108,9 +135,14 @@ export default function HomePage() {
   };
 
   const refreshIssues = async (id) => {
-    const query = includeHidden ? "?include_hidden=true" : "";
-    const rows = await callApi(`/runs/${id}/issues${query}`);
+    const rows = await callApi(`/runs/${id}/issues`);
     setIssues(rows);
+  };
+
+  const refreshRun = async (id) => {
+    const row = await callApi(`/runs/${id}`);
+    setRunStatus(row.status || "");
+    return row;
   };
 
   const refreshStages = async (id) => {
@@ -148,6 +180,7 @@ export default function HomePage() {
         body: JSON.stringify({ task_prompt: taskPrompt, metadata: { created_from: "frontend" } })
       });
       setRunId(run.id);
+      setRunStatus(run.status || "pending");
       setIssues([]);
       setStages([]);
       setSourceDocs([]);
@@ -230,18 +263,28 @@ export default function HomePage() {
       setError("先に少なくとも1件のソースを取り込んでください。");
       return;
     }
+    if (runStatus !== "pending") {
+      setError("主画面では再実行できません。Run単位の復旧は Debug 画面から実行してください。");
+      return;
+    }
     setBusy(true);
     setError("");
     try {
+      setRunStatus("running");
       await callApi(`/runs/${runId}/pipeline`, {
         method: "POST",
         body: JSON.stringify({})
       });
       await waitPipeline(runId);
-      await refreshIssues(runId);
     } catch (e) {
       setError(String(e.message || e));
     } finally {
+      try {
+        await refreshRun(runId);
+        await refreshIssues(runId);
+      } catch {
+        // keep primary error if refresh fails
+      }
       setBusy(false);
     }
   };
@@ -253,6 +296,7 @@ export default function HomePage() {
     setBusy(true);
     setError("");
     try {
+      await refreshRun(runId);
       await refreshIssues(runId);
       await refreshStages(runId);
     } catch (e) {
@@ -306,8 +350,8 @@ export default function HomePage() {
           <button onClick={createRun} disabled={busy}>
             Run 作成
           </button>
-          <button className="secondary" onClick={runPipeline} disabled={busy || !runId}>
-            Pipeline 実行
+          <button className="secondary" onClick={runPipeline} disabled={busy || !runId || runStatus !== "pending"}>
+            Pipeline 初回実行
           </button>
           <button className="secondary" onClick={reload} disabled={busy || !runId}>
             再読込
@@ -316,19 +360,14 @@ export default function HomePage() {
         <div className="mono">
           <span className="chip">API: {API_BASE}</span>
           <span className="chip">run_id: {runId || "-"}</span>
+          <span className="chip">run_status: {runStatus || "-"}</span>
           <span className="chip">sources: {sourceDocs.length}</span>
           <span className="chip">issues: {issues.length}</span>
           <span className="chip">stages: {stages.length}</span>
         </div>
-        <label className="mono">
-          <input
-            type="checkbox"
-            checked={includeHidden}
-            onChange={(e) => setIncludeHidden(e.target.checked)}
-            style={{ marginRight: 6 }}
-          />
-          hidden issue を含めて取得
-        </label>
+        <p className="mono">
+          主画面では再実行を提供しません。復旧操作は <a href="/debug">/debug</a> から実行してください。
+        </p>
         {error ? <p className="mono" style={{ color: "#b12704" }}>{error}</p> : null}
       </section>
 
@@ -379,7 +418,7 @@ export default function HomePage() {
         <article className="panel">
           <h2>Issues</h2>
           {issues.length === 0 ? (
-            <p className="mono">表示可能な論点はまだありません。</p>
+            <p className="mono">{issuesEmptyMessage()}</p>
           ) : (
             issues.map((issue) => (
               <div key={issue.id} className="panel" style={{ marginTop: 10 }}>
@@ -388,7 +427,8 @@ export default function HomePage() {
                 </p>
                 <p>{issue.summary}</p>
                 <p className="mono">
-                  severity={issue.severity} / confidence={issue.confidence.toFixed(2)} / status={issue.status}
+                  severity={severityLabel(issue.severity)}({issue.severity}) / confidence=
+                  {issue.confidence.toFixed(2)} / status={issue.status}
                 </p>
                 <p className="mono">evidences={issue.evidence_count}</p>
                 <button
@@ -405,8 +445,11 @@ export default function HomePage() {
                       <p className="mono">この論点には表示可能な根拠がありません。</p>
                     ) : (
                       sortEvidencesByStrength(issueDetails[issue.id].evidences).map((ev) => {
-                        const selection =
-                          ev.citation_span && typeof ev.citation_span === "object" ? ev.citation_span.selection : null;
+                        const selection = ev.selection && typeof ev.selection === "object"
+                          ? ev.selection
+                          : ev.citation_span && typeof ev.citation_span === "object"
+                            ? ev.citation_span.selection
+                            : null;
                         const selectionWeights =
                           selection && typeof selection === "object" ? selection.weights || null : null;
                         return (

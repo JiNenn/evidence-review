@@ -102,6 +102,7 @@ class IssueEvidenceResponse(BaseModel):
     source_doc_id: uuid.UUID
     chunk_id: uuid.UUID
     citation_span: Optional[Dict[str, Any]]
+    selection: Optional[Dict[str, Any]]
     before_excerpt: Optional[str]
     after_excerpt: Optional[str]
     loc: Optional[Dict[str, Any]]
