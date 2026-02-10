@@ -24,6 +24,13 @@ export default function HomePage() {
   const [authPassword, setAuthPassword] = useState(DEFAULT_AUTH_PASSWORD);
   const [accessToken, setAccessToken] = useState("");
 
+  const formatScore = (value) => {
+    if (typeof value !== "number" || Number.isNaN(value)) {
+      return "-";
+    }
+    return value.toFixed(3);
+  };
+
   const callApi = async (path, options = {}) => {
     const headers = {
       "Content-Type": "application/json",
@@ -358,28 +365,51 @@ export default function HomePage() {
                     {issueDetails[issue.id].evidences.length === 0 ? (
                       <p className="mono">この論点には表示可能な根拠がありません。</p>
                     ) : (
-                      issueDetails[issue.id].evidences.map((ev) => (
-                        <div key={ev.id} className="panel" style={{ marginTop: 8 }}>
-                          <p className="mono">source: {ev.source_title}</p>
-                          {ev.before_excerpt ? (
-                            <>
-                              <p className="mono">before</p>
-                              <pre>{ev.before_excerpt}</pre>
-                            </>
-                          ) : null}
-                          {ev.after_excerpt ? (
-                            <>
-                              <p className="mono">after</p>
-                              <pre>{ev.after_excerpt}</pre>
-                            </>
-                          ) : null}
-                          <p className="mono">evidence snippet</p>
-                          <pre>{ev.chunk_text}</pre>
-                          <a href={ev.source_presigned_url} target="_blank" rel="noreferrer" className="mono">
-                            原文を開く
-                          </a>
-                        </div>
-                      ))
+                      issueDetails[issue.id].evidences.map((ev) => {
+                        const selection =
+                          ev.citation_span && typeof ev.citation_span === "object" ? ev.citation_span.selection : null;
+                        const selectionWeights =
+                          selection && typeof selection === "object" ? selection.weights || null : null;
+                        return (
+                          <div key={ev.id} className="panel" style={{ marginTop: 8 }}>
+                            <p className="mono">source: {ev.source_title}</p>
+                            {ev.before_excerpt ? (
+                              <>
+                                <p className="mono">before</p>
+                                <pre>{ev.before_excerpt}</pre>
+                              </>
+                            ) : null}
+                            {ev.after_excerpt ? (
+                              <>
+                                <p className="mono">after</p>
+                                <pre>{ev.after_excerpt}</pre>
+                              </>
+                            ) : null}
+                            <p className="mono">evidence snippet</p>
+                            <pre>{ev.chunk_text}</pre>
+                            {selection ? (
+                              <div className="panel" style={{ marginTop: 8 }}>
+                                <p className="mono">
+                                  selection={selection.version || "unknown"} / combined=
+                                  {formatScore(selection.combined_score)}
+                                </p>
+                                <p className="mono">
+                                  search={formatScore(selection.search_score)} / lexical=
+                                  {formatScore(selection.lexical_score)} / rank=
+                                  {selection.search_rank ?? "-"}
+                                </p>
+                                <p className="mono">
+                                  w(search)={formatScore(selectionWeights?.search_score)} / w(lexical)=
+                                  {formatScore(selectionWeights?.lexical_score)}
+                                </p>
+                              </div>
+                            ) : null}
+                            <a href={ev.source_presigned_url} target="_blank" rel="noreferrer" className="mono">
+                              原文を開く
+                            </a>
+                          </div>
+                        );
+                      })
                     )}
                   </div>
                 ) : null}
