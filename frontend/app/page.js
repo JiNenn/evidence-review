@@ -24,11 +24,50 @@ export default function HomePage() {
   const [authPassword, setAuthPassword] = useState(DEFAULT_AUTH_PASSWORD);
   const [accessToken, setAccessToken] = useState("");
 
+  const toNumberOr = (value, fallback) => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      return fallback;
+    }
+    return parsed;
+  };
+
   const formatScore = (value) => {
     if (typeof value !== "number" || Number.isNaN(value)) {
       return "-";
     }
     return value.toFixed(3);
+  };
+
+  const getEvidenceStrength = (evidence) => {
+    const selection =
+      evidence?.citation_span && typeof evidence.citation_span === "object" ? evidence.citation_span.selection : null;
+    if (!selection || typeof selection !== "object") {
+      return {
+        combined: -1,
+        search: -1,
+        lexical: -1,
+        rank: Number.MAX_SAFE_INTEGER
+      };
+    }
+    return {
+      combined: toNumberOr(selection.combined_score, -1),
+      search: toNumberOr(selection.search_score, -1),
+      lexical: toNumberOr(selection.lexical_score, -1),
+      rank: toNumberOr(selection.search_rank, Number.MAX_SAFE_INTEGER)
+    };
+  };
+
+  const sortEvidencesByStrength = (evidences) => {
+    return [...evidences].sort((a, b) => {
+      const ax = getEvidenceStrength(a);
+      const bx = getEvidenceStrength(b);
+      if (bx.combined !== ax.combined) return bx.combined - ax.combined;
+      if (bx.search !== ax.search) return bx.search - ax.search;
+      if (bx.lexical !== ax.lexical) return bx.lexical - ax.lexical;
+      if (ax.rank !== bx.rank) return ax.rank - bx.rank;
+      return String(a.id).localeCompare(String(b.id));
+    });
   };
 
   const callApi = async (path, options = {}) => {
@@ -365,7 +404,7 @@ export default function HomePage() {
                     {issueDetails[issue.id].evidences.length === 0 ? (
                       <p className="mono">この論点には表示可能な根拠がありません。</p>
                     ) : (
-                      issueDetails[issue.id].evidences.map((ev) => {
+                      sortEvidencesByStrength(issueDetails[issue.id].evidences).map((ev) => {
                         const selection =
                           ev.citation_span && typeof ev.citation_span === "object" ? ev.citation_span.selection : null;
                         const selectionWeights =
