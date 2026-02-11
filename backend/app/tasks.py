@@ -256,6 +256,19 @@ def vector_similarity_score(query: str, text: str) -> float:
     return cosine_similarity_from_counts(query_counts, text_counts)
 
 
+def ngram_key_set(text: str, n: int = 3) -> set[str]:
+    return set(char_ngram_counts(text, n=n).keys())
+
+
+def jaccard_similarity(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    union_size = len(a.union(b))
+    if union_size == 0:
+        return 0.0
+    return len(a.intersection(b)) / float(union_size)
+
+
 def clamp_score(value: Any) -> float:
     try:
         parsed = float(value)
@@ -1038,6 +1051,9 @@ def derive_issues_from_changes(self, run_id: str) -> Dict[str, Any]:
             db.flush()
 
             created = 0
+            dedup_merged_count = 0
+            dedup_similarity_threshold = max(0.0, min(1.0, float(settings.issue_dedup_similarity_threshold)))
+            groups: list[dict[str, Any]] = []
             for idx, span in enumerate(spans):
                 status = span.get("status", "modified")
                 title_prefix = {
@@ -1047,44 +1063,102 @@ def derive_issues_from_changes(self, run_id: str) -> Dict[str, Any]:
                 }.get(status, "論点候補")
                 before_excerpt = span.get("before_excerpt") or ""
                 after_excerpt = span.get("after_excerpt") or ""
-                summary = f"{title_prefix}: {after_excerpt or before_excerpt}"
                 severity = 3 if status in {"modified", "removed"} else 2
                 confidence = min(0.99, max(0.4, float(span.get("score", 0.5))))
                 phase = span.get("phase", "")
-                fingerprint = hash_key(
-                    "issue-fingerprint-v2",
-                    phase,
-                    status,
-                    normalize_fingerprint_text(before_excerpt),
-                    normalize_fingerprint_text(after_excerpt),
+                normalized_before = normalize_fingerprint_text(before_excerpt)
+                normalized_after = normalize_fingerprint_text(after_excerpt)
+                dedup_basis_text = f"{phase}\n{status}\n{normalized_before}\n{normalized_after}"
+                gram_set = ngram_key_set(dedup_basis_text)
+                if not gram_set:
+                    gram_set = {f"phase={phase}|status={status}|empty"}
+
+                best_group: dict[str, Any] | None = None
+                best_similarity = 0.0
+                for group in groups:
+                    if group["phase"] != phase or group["status"] != status:
+                        continue
+                    similarity = jaccard_similarity(gram_set, group["gram_set"])
+                    if similarity > best_similarity:
+                        best_similarity = similarity
+                        best_group = group
+
+                if best_group and best_similarity >= dedup_similarity_threshold:
+                    dedup_merged_count += 1
+                    best_group["gram_set"] = best_group["gram_set"].union(gram_set)
+                    best_group["dedup_count"] += 1
+                    best_group["span_ids"].append(span.get("span_id"))
+                    best_group["severity"] = max(best_group["severity"], severity)
+                    best_group["confidence"] = max(best_group["confidence"], confidence)
+                    if len(after_excerpt) > len(best_group["after_excerpt"]):
+                        best_group["after_excerpt"] = after_excerpt
+                    if len(before_excerpt) > len(best_group["before_excerpt"]):
+                        best_group["before_excerpt"] = before_excerpt
+                    best_group["summary"] = (
+                        f"{best_group['title_prefix']}: "
+                        f"{best_group['after_excerpt'] or best_group['before_excerpt']}"
+                    )
+                    continue
+
+                groups.append(
+                    {
+                        "phase": phase,
+                        "status": status,
+                        "title_prefix": title_prefix,
+                        "summary": f"{title_prefix}: {after_excerpt or before_excerpt}",
+                        "severity": severity,
+                        "confidence": confidence,
+                        "before_excerpt": before_excerpt,
+                        "after_excerpt": after_excerpt,
+                        "primary_span_id": span.get("span_id"),
+                        "span_ids": [span.get("span_id")],
+                        "gram_set": gram_set,
+                        "dedup_count": 1,
+                        "first_idx": idx,
+                    }
                 )
 
+            for group_idx, group in enumerate(groups, start=1):
+                fingerprint_basis = sorted(group["gram_set"])[:512]
+                fingerprint = hash_key(
+                    "issue-fingerprint-v3",
+                    group["phase"],
+                    group["status"],
+                    fingerprint_basis,
+                )
                 db.add(
                     Issue(
                         run_id=run_uuid,
                         fingerprint=fingerprint[:120],
-                        title=f"{title_prefix} #{idx + 1}",
-                        summary=summary[:2000],
-                        severity=severity,
-                        confidence=confidence,
+                        title=f"{group['title_prefix']} #{group_idx}",
+                        summary=(group["summary"] or "")[:2000],
+                        severity=group["severity"],
+                        confidence=group["confidence"],
                         status=IssueStatus.open,
                         metadata_={
-                            "phase": span.get("phase"),
-                            "span_id": span.get("span_id"),
-                            "status": status,
-                            "before_excerpt": before_excerpt,
-                            "after_excerpt": after_excerpt,
+                            "phase": group["phase"],
+                            "span_id": group["primary_span_id"],
+                            "status": group["status"],
+                            "before_excerpt": group["before_excerpt"],
+                            "after_excerpt": group["after_excerpt"],
+                            "merged_span_ids": [sid for sid in group["span_ids"] if sid][:50],
+                            "dedup_count": group["dedup_count"],
                             "fingerprint_basis": {
-                                "version": "v2",
-                                "phase": phase,
-                                "status": status,
+                                "version": "v3",
+                                "phase": group["phase"],
+                                "status": group["status"],
+                                "dedup_similarity_threshold": dedup_similarity_threshold,
                             },
                         },
                     )
                 )
                 created += 1
 
-            return {"issue_count": created}
+            return {
+                "issue_count": created,
+                "dedup_merged_count": dedup_merged_count,
+                "dedup_similarity_threshold": dedup_similarity_threshold,
+            }
 
         return execute_stage(
             db,

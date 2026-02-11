@@ -184,6 +184,8 @@
 * `issues` は **issue_evidences が1件以上** あるものだけを UI表示対象とする。
 * `fingerprint` は同趣旨Issueの安定キーとして、最低限 `change_type + phase + 正規化before/after要約` を入力に含める
   （Evidence解決結果 `source_doc_id/chunk_id` は含めない）
+* 同趣旨Issueの増殖を防ぐため、`derive_issues_from_changes` で char n-gram Jaccard により統合してから
+  fingerprint を生成する（v0.1実装は `fingerprint v3`）
 * loc解決の優先順位は `source_chunks.loc` を正本とし、`issue_evidences.loc` はキャッシュとして扱う
 
 ### 5.4 SourceDoc / SourceChunk（ソースとチャンク）
@@ -420,6 +422,7 @@
 * `JWT_SECRET, JWT_EXPIRES_IN`
 * `AUTH_ENABLED, AUTH_DEV_USER, AUTH_DEV_PASSWORD`
 * `LLM_PROVIDER, LLM_API_KEY, MODEL_HIGH, MODEL_LOW`（キーはSecrets扱い）
+* `ISSUE_DEDUP_SIMILARITY_THRESHOLD`
 
 ---
 

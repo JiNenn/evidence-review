@@ -9,6 +9,7 @@ Evidence-first UX を業務運用に近づけるための改修優先度を整�
 - 完了: P0-3 監査専用 API `/runs/{run_id}/audit/issues` 追加（互換維持）
 - 完了: P0-4 `blocked_evidence` の failure_detail に summary を追加
 - 完了: P1-1 vector fallback を char n-gram cosine 検索で実体化
+- 完了: P1-2 issue fingerprint の重複抑止（char n-gram Jaccard統合 + v3 fingerprint）
 
 ## P0: 直近で実装すべき
 

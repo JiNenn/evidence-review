@@ -246,6 +246,20 @@ def test_normal_and_compat(api_base: str, headers: dict) -> tuple[str, int, str]
     assert_true(isinstance(issues, list) and len(issues) > 0, "issues should exist")
     assert_true(all(issue.get("evidence_count", 0) >= 1 for issue in issues), "all issues must have evidence")
     assert_true(all(issue.get("status") != "hidden" for issue in issues), "hidden issues must not be listed")
+    stage_rows = http_json("GET", f"{api_base}/runs/{run_id}/stages", None, headers)
+    derive_stage = next(
+        (
+            row
+            for row in stage_rows
+            if row.get("stage_name") == "derive_issues_from_changes" and row.get("status") == "success"
+        ),
+        None,
+    )
+    assert_true(bool(derive_stage), "derive_issues_from_changes stage should succeed")
+    derive_output = (derive_stage or {}).get("output_ref") or {}
+    assert_true("dedup_similarity_threshold" in derive_output, "derive stage should expose dedup threshold")
+    assert_true("dedup_merged_count" in derive_output, "derive stage should expose dedup merged count")
+
     issues_all = http_json("GET", f"{api_base}/runs/{run_id}/issues?include_hidden=true", None, headers)
     assert_true(isinstance(issues_all, list), "issues include_hidden should return list")
     assert_true(len(issues_all) >= len(issues), "include_hidden should return at least as many issues")

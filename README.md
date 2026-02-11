@@ -55,6 +55,7 @@ docker compose up --build
   - ingest, low draft, search, feedback(with citation), apply feedback, high final
   - detect_change_spans, derive_issues_from_changes, attach_evidence_to_issues, full pipeline
   - `search(mode=vector)` は char n-gram cosine を使った類似度検索で実装
+  - `derive_issues_from_changes` は char n-gram Jaccard による重複統合後に `fingerprint v3` を生成
 - Citation detail:
   - `GET /citations/{citation_id}` で根拠スニペットと原文URLを取得
 - Evidence-first rule:
