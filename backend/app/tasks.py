@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import math
 import re
 import uuid
 from datetime import datetime, timezone
@@ -215,6 +216,44 @@ def normalize_fingerprint_text(text: str) -> str:
 
 def tokens(text: str) -> set[str]:
     return set(re.findall(r"\w+", (text or "").lower()))
+
+
+def normalized_text(text: str) -> str:
+    return " ".join((text or "").lower().split())
+
+
+def char_ngram_counts(text: str, n: int = 3) -> Dict[str, int]:
+    normalized = normalized_text(text).replace(" ", "")
+    if not normalized:
+        return {}
+    if len(normalized) < n:
+        return {normalized: 1}
+    counts: Dict[str, int] = {}
+    for i in range(len(normalized) - n + 1):
+        gram = normalized[i : i + n]
+        counts[gram] = counts.get(gram, 0) + 1
+    return counts
+
+
+def cosine_similarity_from_counts(a: Dict[str, int], b: Dict[str, int]) -> float:
+    if not a or not b:
+        return 0.0
+    dot = 0.0
+    for key, value in a.items():
+        dot += float(value * b.get(key, 0))
+    if dot <= 0.0:
+        return 0.0
+    norm_a = math.sqrt(sum(float(v * v) for v in a.values()))
+    norm_b = math.sqrt(sum(float(v * v) for v in b.values()))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return max(0.0, min(1.0, dot / (norm_a * norm_b)))
+
+
+def vector_similarity_score(query: str, text: str) -> float:
+    query_counts = char_ngram_counts(query)
+    text_counts = char_ngram_counts(text)
+    return cosine_similarity_from_counts(query_counts, text_counts)
 
 
 def clamp_score(value: Any) -> float:
@@ -481,14 +520,18 @@ def search_chunks(
             for chunk, source_doc in rows:
                 text = chunk.text or ""
                 score = 0.0
+                score_reason = "no_match"
                 if mode == "keyword":
                     if q.lower() in text.lower():
                         score = len(q) / max(len(text), 1)
+                        score_reason = "keyword_substring"
                 elif mode == "regex":
                     if rx and rx.search(text):
                         score = 1.0
+                        score_reason = "regex_match"
                 else:
-                    score = 0.1 if q.lower() in text.lower() else 0.0
+                    score = vector_similarity_score(q, text)
+                    score_reason = "char_ngram_cosine"
 
                 if score > min_score:
                     scored.append(
@@ -497,7 +540,12 @@ def search_chunks(
                             "chunk_id": chunk.id,
                             "snippet": text[:240],
                             "score": float(score),
-                            "payload": {"loc": chunk.loc},
+                            "payload": {
+                                "loc": chunk.loc,
+                                "mode": mode,
+                                "score_reason": score_reason,
+                                "min_score": min_score,
+                            },
                         }
                     )
 

@@ -183,6 +183,19 @@ def collect_run_selection_signature(api_base: str, headers: dict, run_id: str) -
     return signature_rows
 
 
+def wait_search_success(api_base: str, headers: dict, search_id: str) -> dict:
+    def poll_search():
+        row = http_json("GET", f"{api_base}/search/{search_id}", None, headers)
+        status = row.get("status")
+        if status == "success":
+            return row
+        if status == "failed":
+            raise AssertionError("search should not fail in vector smoke")
+        return None
+
+    return poll(poll_search, timeout_sec=40)
+
+
 def test_normal_and_compat(api_base: str, headers: dict) -> tuple[str, int, str]:
     run = http_json(
         "POST",
@@ -289,6 +302,20 @@ def test_normal_and_compat(api_base: str, headers: dict) -> tuple[str, int, str]
     assert_true(isinstance(artifacts, list), "artifacts endpoint should be compatible")
     assert_true(isinstance(feedback, list), "feedback endpoint should be compatible")
     artifact_count_before = len(artifacts)
+
+    vector_search = http_json(
+        "POST",
+        f"{api_base}/runs/{run_id}/search",
+        {"query": "レビュー論点の根拠", "mode": "vector", "filters": {"top_k": 5, "min_score": 0.0}},
+        headers,
+    )
+    vector_search_full = wait_search_success(api_base, headers, vector_search["id"])
+    vector_results = vector_search_full.get("results", [])
+    assert_true(isinstance(vector_results, list) and len(vector_results) > 0, "vector search should return results")
+    assert_true(
+        all((row.get("payload") or {}).get("score_reason") == "char_ngram_cosine" for row in vector_results),
+        "vector search results should include score_reason=char_ngram_cosine",
+    )
 
     # idempotency: same input rerun should not create duplicated artifacts
     http_json("POST", f"{api_base}/runs/{run_id}/pipeline", {}, headers)
