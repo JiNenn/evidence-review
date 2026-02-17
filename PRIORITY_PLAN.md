@@ -10,6 +10,10 @@ Evidence-first UX を業務運用に近づけるための改修優先度を整�
 - 完了: P0-4 `blocked_evidence` の failure_detail に summary を追加
 - 完了: P1-1 vector fallback を char n-gram cosine 検索で実体化
 - 完了: P1-2 issue fingerprint の重複抑止（char n-gram Jaccard統合 + v3 fingerprint）
+- 完了: P1-3 `run_stage_attempts` 導入で stage 試行履歴を永続化
+- 完了: P2-1 role ベース認可（`AUTH_USERS_JSON` + audit/admin 制御）を導入
+- 完了: P2-2 `GET /runs/{run_id}/metrics` で hidden率・selection分布・retry成功率を可視化
+- 完了: P2-3 Issue 一覧の evidence強度/影響度/未解決状態の sort/filter UI を追加
 
 ## P0: 直近で実装すべき
 
@@ -67,3 +71,24 @@ Issue 一覧で evidence 強度、影響度、未解決状態で並び替え/フ
 
 5. `blocked_evidence` の復旧操作は Issue単位ではなく Run単位の `debug` 画面に限定する。  
 主画面には再実行ボタンを置かない。
+
+6. Home と Run 一覧は同一画面に統合する。  
+一覧の主目的は Run 詳細へのアクセスとし、一覧には公開メタ情報のみを表示する。
+
+7. 認証は「Run 詳細へ入るタイミング」で要求する。  
+初手の `Token取得` 操作は廃止し、未認証で詳細遷移した場合のみログイン導線へ遷移する。
+
+8. `blocked_evidence` 時は Run 詳細に `Debugで復旧` ボタンを置く。  
+`run_id` と `return_to`（元ページ相対URL）を渡して Debug へ遷移させる。
+
+9. `return_to` はアプリ内相対パスのみ許可する。  
+外部URLや `//` 形式は拒否し、Open Redirect を防ぐ。
+
+10. Debug は復旧専用画面として扱い、Debug固有の Auth 入力フォームは置かない。  
+認証はアプリ共通セッションで処理し、`401` 時のみログインへ遷移する。
+
+11. 復旧実行後は `run.status` を監視し、`success/success_partial` で自動復帰する。  
+復帰前に「3秒後に戻る（今すぐ戻る/Debugに残る）」導線を表示する。
+
+12. 復旧失敗時（`blocked_evidence`/`failed_system`）は Debug に留まり、  
+`failure_detail.summary` と次アクションを表示する。

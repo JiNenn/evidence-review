@@ -7,7 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
-from app.models import Run, RunStage, RunStatus, StageFailureType, StageStatus
+from app.models import Run, RunStage, RunStageAttempt, RunStatus, StageFailureType, StageStatus
 
 
 def utc_now() -> datetime:
@@ -62,11 +62,13 @@ def _persist_failed_stage(
     error: Exception,
     failure_type: StageFailureType,
     failure_detail: Dict[str, Any] | None,
+    started_at: datetime | None = None,
 ) -> None:
     """
     Persist failed status in an independent transaction so outer rollback cannot erase it.
     """
     failed_at = utc_now()
+    attempt_started_at = started_at or failed_at
     with SessionLocal() as failure_db:
         _advisory_lock_idempotency(failure_db, idempotency_key)
         stage = (
@@ -83,11 +85,12 @@ def _persist_failed_stage(
                 failure_type=failure_type,
                 failure_detail={**(failure_detail or {}), "error": str(error)},
                 attempt=1,
-                started_at=failed_at,
+                started_at=attempt_started_at,
                 finished_at=failed_at,
                 output_ref={"error": str(error)},
             )
             failure_db.add(stage)
+            attempt_no = 1
         else:
             if stage.run_id != run_id or stage.stage_name != stage_name:
                 raise ValueError("idempotency_key collision across run_id/stage_name")
@@ -96,10 +99,26 @@ def _persist_failed_stage(
             stage.failure_type = failure_type
             stage.failure_detail = {**(failure_detail or {}), "error": str(error)}
             stage.attempt = (stage.attempt or 0) + 1
-            if stage.started_at is None:
-                stage.started_at = failed_at
+            stage.started_at = attempt_started_at
             stage.finished_at = failed_at
             stage.output_ref = {"error": str(error)}
+            attempt_no = stage.attempt
+
+        failure_db.flush()
+        failure_db.add(
+            RunStageAttempt(
+                run_stage_id=stage.id,
+                run_id=run_id,
+                stage_name=stage_name,
+                attempt_no=attempt_no,
+                status=StageStatus.failed,
+                failure_type=failure_type,
+                failure_detail={**(failure_detail or {}), "error": str(error)},
+                output_ref={"error": str(error)},
+                started_at=attempt_started_at,
+                finished_at=failed_at,
+            )
+        )
 
         run = failure_db.get(Run, run_id)
         if run is not None:
@@ -141,8 +160,10 @@ def execute_stage(
     stage.status = StageStatus.running
     stage.failure_type = None
     stage.failure_detail = None
-    stage.attempt += 1
-    stage.started_at = utc_now()
+    stage_attempt_no = (stage.attempt or 0) + 1
+    stage.attempt = stage_attempt_no
+    stage_started_at = utc_now()
+    stage.started_at = stage_started_at
     stage.finished_at = None
     db.flush()
 
@@ -159,13 +180,29 @@ def execute_stage(
             error=exc,
             failure_type=failure_type,
             failure_detail=failure_detail,
+            started_at=stage_started_at,
         )
         raise
 
+    finished_at = utc_now()
     stage.status = StageStatus.success
     stage.failure_type = None
     stage.failure_detail = None
-    stage.finished_at = utc_now()
+    stage.finished_at = finished_at
     stage.output_ref = output_ref
+    db.add(
+        RunStageAttempt(
+            run_stage_id=stage.id,
+            run_id=run_id,
+            stage_name=stage_name,
+            attempt_no=stage_attempt_no,
+            status=StageStatus.success,
+            failure_type=None,
+            failure_detail=None,
+            output_ref=output_ref,
+            started_at=stage_started_at,
+            finished_at=finished_at,
+        )
+    )
     db.flush()
     return StageExecution(already_succeeded=False, output_ref=output_ref)

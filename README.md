@@ -32,6 +32,8 @@ docker compose up --build
 
 - API docs: `http://localhost:8000/docs`
 - Frontend: `http://localhost:3000`
+- Run detail: `http://localhost:3000/runs/{run_id}`
+- Login: `http://localhost:3000/login?next=/runs/{run_id}`
 - MinIO Console: `http://localhost:9001`
 - Health: `GET /healthz`, `GET /readyz`
 
@@ -44,8 +46,11 @@ docker compose up --build
   - `run_stages` (idempotency)
   - `search_requests`, `search_results`
 - API endpoints:
+  - `GET /runs` (公開メタ一覧: title/status/counts)
   - Runs, Issues, Source presign/ingest, Pipeline kickoff, Search, Health
   - `GET /runs/{run_id}/stages` で stageの成否・attempt・failure_type・failure_detail・errorを確認可能
+  - `GET /runs/{run_id}/stage-attempts` で stage試行履歴（attempt_no単位）を確認可能
+  - `GET /runs/{run_id}/metrics` で hidden率・selectionスコア分布・retry成功率を取得可能
   - `GET /runs/{run_id}/issues?include_hidden=true` は監査用途（AUTH有効時は監査権限のみ）
   - `GET /runs/{run_id}/audit/issues` は監査UI用の専用導線（hidden含む）
   - `POST /auth/token`（JWT発行）
@@ -53,6 +58,7 @@ docker compose up --build
   - `POST /runs/{run_id}/sources/ingest` は `source_doc_id` 主導で実行される
 - Worker tasks:
   - ingest, low draft, search, feedback(with citation), apply feedback, high final
+  - `apply_feedback` は feedback 群を反映した改稿をLLM生成（stub時は決定的フォールバック）
   - detect_change_spans, derive_issues_from_changes, attach_evidence_to_issues, full pipeline
   - `search(mode=vector)` は char n-gram cosine を使った類似度検索で実装
   - `derive_issues_from_changes` は char n-gram Jaccard による重複統合後に `fingerprint v3` を生成
@@ -68,12 +74,19 @@ docker compose up --build
 
 ## Notes
 
-- LLM integration is currently stubbed for local validation.
+- LLM integration supports two modes:
+  - `LLM_PROVIDER=stub`: deterministic local stub generation (default)
+  - `LLM_PROVIDER=openai` or `openai_compatible`: calls `${LLM_BASE_URL}/chat/completions`
+- When using a non-stub provider, `LLM_API_KEY` is required.
+- `LLM_TIMEOUT_SECONDS` controls API timeout for worker-side LLM calls.
 - `ingest_source_doc` は MinIOから実データを取得し、text/json/html/pdf を抽出してチャンク化します。
 - Browserから直接S3へPUT/GETするため `S3_PUBLIC_ENDPOINT` を利用します（compose既定: `http://localhost:9000`）。
 - 認証は `AUTH_ENABLED` で有効化し、Bearer JWTでAPIを保護します。
-- Frontend は `Run作成 -> Sourceアップロード/取り込み -> Pipeline実行 -> Stages/Issues確認` の流れを1画面で実行できます。
+- AUTH有効時は `AUTH_USERS_JSON` でユーザー/ロールを定義できます（`audit` または `admin` ロールのみ hidden監査導線を利用可能）。
+- Frontend は Home(`/`) と Run詳細(`/runs/{run_id}`) を分離し、
+  `Run作成/一覧 -> 詳細遷移 -> Sourceアップロード/取り込み -> Pipeline実行 -> Issues確認` の流れで実行します。
 - Frontend 主画面は再実行操作を持たず、復旧操作は `http://localhost:3000/debug` の Run単位導線で行います。
+- Debug画面では `stage-attempts` を使って stage試行履歴を確認できます。
 - `run.status` は `success / success_partial / blocked_evidence / failed_system / failed_legacy` を区別します。
 - `attempt` は同一 `idempotency_key` に対する再試行回数です。
 - presignのみで放置された orphan `source_docs` はTTL超過時に自動クリーンアップされます（`SOURCE_DOC_ORPHAN_TTL_HOURS`）。

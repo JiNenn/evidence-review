@@ -17,6 +17,14 @@ from sqlalchemy.exc import IntegrityError
 from app.celery_app import celery_app
 from app.config import get_settings
 from app.database import session_scope
+from app.llm_client import (
+    LLMClientConfigError,
+    LLMClientError,
+    LLMClientResponseError,
+    LLMClientTransientError,
+    chat_complete,
+    provider_is_stub,
+)
 from app.models import (
     Artifact,
     ArtifactFormat,
@@ -41,7 +49,7 @@ from app.stage import StageFailureError, execute_stage
 
 logger = get_task_logger(__name__)
 settings = get_settings()
-PROMPT_TEMPLATE_VERSION = "v1"
+PROMPT_TEMPLATE_VERSION = "v2"
 
 
 def now_utc() -> datetime:
@@ -209,6 +217,49 @@ def excerpt(text: str, limit: int = 220) -> str:
     return cleaned[:limit]
 
 
+def multiline_excerpt(text: str, *, max_chars: int = 5000, max_lines: int = 140) -> str:
+    raw = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not raw:
+        return ""
+    lines = raw.split("\n")
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+    clipped = "\n".join(lines)
+    if len(clipped) > max_chars:
+        clipped = clipped[:max_chars]
+    return clipped.strip()
+
+
+def first_focus_line(text: str, limit: int = 96) -> str:
+    for line in (text or "").splitlines():
+        stripped = re.sub(r"^[#>\-\+\*\d\.\)\( ]+", "", line.strip())
+        if not stripped:
+            continue
+        return stripped[:limit]
+    return ""
+
+
+def issue_title_from_span(status: str, *, before_text: str, after_text: str) -> str:
+    focus = first_focus_line(after_text) or first_focus_line(before_text) or "差分箇所"
+    if status == "modified":
+        return f"{focus} の変更意図と影響範囲を確認する"
+    if status == "added":
+        return f"{focus} の追加内容が妥当か確認する"
+    if status == "removed":
+        return f"{focus} の削除影響を確認する"
+    return f"{focus} に関する論点を確認する"
+
+
+def issue_summary_from_span(*, before_preview: str, after_preview: str) -> str:
+    if before_preview and after_preview:
+        return f"before: {before_preview} / after: {after_preview}"
+    if after_preview:
+        return f"after: {after_preview}"
+    if before_preview:
+        return f"before: {before_preview}"
+    return "差分の具体内容を確認し、根拠付きで妥当性を判断してください。"
+
+
 def normalize_fingerprint_text(text: str) -> str:
     cleaned = " ".join((text or "").lower().split())
     return cleaned[:512]
@@ -349,6 +400,152 @@ def choose_best_chunk(
     return scored[0]
 
 
+def collect_source_context(db, run_id: uuid.UUID, *, limit_chunks: int = 4, max_chars: int = 2600) -> str:
+    rows = (
+        db.query(SourceChunk, SourceDoc)
+        .join(SourceDoc, SourceChunk.source_doc_id == SourceDoc.id)
+        .filter(SourceDoc.run_id == run_id)
+        .order_by(SourceDoc.created_at.asc(), SourceChunk.chunk_index.asc())
+        .limit(limit_chunks)
+        .all()
+    )
+    if not rows:
+        return "（ソースチャンクなし）"
+
+    parts: list[str] = []
+    total = 0
+    for chunk, source in rows:
+        text = (chunk.text or "").strip()
+        if not text:
+            continue
+        piece = f"[{source.title} / chunk {chunk.chunk_index}]\n{text[:900]}"
+        next_total = total + len(piece) + 2
+        if next_total > max_chars and parts:
+            break
+        parts.append(piece)
+        total = next_total
+    return "\n\n".join(parts) if parts else "（ソースチャンクなし）"
+
+
+def source_chunk_fingerprint(db, run_id: uuid.UUID) -> str:
+    rows = (
+        db.query(SourceDoc.id, SourceChunk.id, SourceChunk.chunk_index)
+        .join(SourceChunk, SourceChunk.source_doc_id == SourceDoc.id)
+        .filter(SourceDoc.run_id == run_id)
+        .order_by(SourceDoc.created_at.asc(), SourceChunk.chunk_index.asc())
+        .all()
+    )
+    if not rows:
+        return "no_source_chunks"
+    return digest_rows(rows)
+
+
+def artifact_ref_fingerprint(item: Artifact | None) -> str:
+    if item is None:
+        return "none"
+    return hash_key(str(item.id), item.version, item.created_at.isoformat())
+
+
+def feedback_rows_fingerprint(feedbacks: List[FeedbackItem]) -> str:
+    if not feedbacks:
+        return "no_feedback"
+    rows = [
+        (fb.id, fb.target_artifact_id, fb.text, fb.category, fb.severity, fb.created_at)
+        for fb in feedbacks
+    ]
+    return digest_rows(rows)
+
+
+def collect_feedback_context(
+    db,
+    feedbacks: List[FeedbackItem],
+    *,
+    max_chars: int = 2600,
+) -> str:
+    if not feedbacks:
+        return "（フィードバックなし）"
+
+    parts: list[str] = []
+    total = 0
+    for idx, fb in enumerate(feedbacks, start=1):
+        citation_row = (
+            db.query(Citation, SourceChunk, SourceDoc)
+            .join(SourceChunk, SourceChunk.id == Citation.chunk_id)
+            .join(SourceDoc, SourceDoc.id == Citation.source_doc_id)
+            .filter(Citation.feedback_id == fb.id)
+            .order_by(SourceChunk.chunk_index.asc())
+            .first()
+        )
+        if citation_row is None:
+            evidence_text = "（引用なし）"
+        else:
+            _, chunk, source = citation_row
+            snippet = " ".join((chunk.text or "").split())[:220]
+            evidence_text = f"{source.title} / chunk {chunk.chunk_index}: {snippet}"
+        piece = (
+            f"{idx}. 指摘: {fb.text}\n"
+            f"   category={fb.category}, severity={fb.severity}\n"
+            f"   根拠: {evidence_text}"
+        )
+        next_total = total + len(piece) + 2
+        if next_total > max_chars and parts:
+            break
+        parts.append(piece)
+        total = next_total
+    return "\n\n".join(parts) if parts else "（フィードバックなし）"
+
+
+def llm_text_or_stub(
+    *,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    stub_text: str,
+    temperature: float = 0.2,
+    max_tokens: int = 1000,
+) -> str:
+    if provider_is_stub():
+        return stub_text
+    try:
+        text = chat_complete(
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    except LLMClientConfigError as exc:
+        raise StageFailureError(
+            "LLM 設定エラーのため生成できませんでした",
+            failure_type=StageFailureType.validation_error,
+            failure_detail={
+                "summary": "LLM設定を確認してください（provider / api key / base_url）",
+                "reason": str(exc),
+            },
+        ) from exc
+    except LLMClientTransientError as exc:
+        raise RuntimeError(f"LLM 一時障害のため再試行します: {exc}") from exc
+    except LLMClientResponseError as exc:
+        raise StageFailureError(
+            "LLM 応答形式エラーのため生成できませんでした",
+            failure_type=StageFailureType.system_error,
+            failure_detail={
+                "summary": "LLM応答を解釈できませんでした",
+                "reason": str(exc),
+            },
+        ) from exc
+    except LLMClientError as exc:
+        raise RuntimeError(f"LLM 生成で失敗しました: {exc}") from exc
+    text = text.strip()
+    if not text:
+        raise StageFailureError(
+            "LLM 生成結果が空のため処理を続行できません",
+            failure_type=StageFailureType.system_error,
+            failure_detail={"summary": "LLMの出力が空文字でした"},
+        )
+    return text
+
+
 @celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, retry_kwargs={"max_retries": 3})
 def ingest_source_doc(
     self,
@@ -421,30 +618,61 @@ def ingest_source_doc(
         return result.output_ref
 
 
-@celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, retry_kwargs={"max_retries": 3})
+@celery_app.task(bind=True, autoretry_for=(RuntimeError,), retry_backoff=True, retry_kwargs={"max_retries": 3})
 def generate_low_draft(self, run_id: str, model_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     run_uuid = uuid.UUID(run_id)
     stage_name = "generate_low_draft"
-    idempotency_key = stage_idempotency_key(
-        run_id=run_id,
-        stage_name=stage_name,
-        stage_input_fingerprint={"task": "low_draft"},
-        model_cfg=model_cfg or {},
-    )
 
     with session_scope() as db:
         run = get_run_or_raise(db, run_uuid)
+        source_fp = source_chunk_fingerprint(db, run_uuid)
+        idempotency_key = stage_idempotency_key(
+            run_id=run_id,
+            stage_name=stage_name,
+            stage_input_fingerprint={
+                "task": "low_draft",
+                "task_prompt": hash_key(run.task_prompt or ""),
+                "source_chunk_fp": source_fp,
+            },
+            model_cfg=model_cfg or {},
+        )
 
         def work() -> Dict[str, Any]:
+            model_name = (model_cfg or {}).get("model", settings.model_low)
+            source_context = collect_source_context(db, run_uuid)
+            generated_text = llm_text_or_stub(
+                model=model_name,
+                system_prompt=(
+                    "あなたは文書作成アシスタントです。"
+                    "根拠に基づいた実務向けの下書きを日本語で作成してください。"
+                    "見出しと箇条書きで簡潔に構造化してください。"
+                ),
+                user_prompt=(
+                    "タスク:\n"
+                    f"{run.task_prompt}\n\n"
+                    "根拠スニペット:\n"
+                    f"{source_context}\n\n"
+                    "出力要件:\n"
+                    "- Markdownのみ\n"
+                    "- 先頭は '# Low Draft' で開始\n"
+                    "- 冒頭に短い要約を置く\n"
+                    "- 具体的な箇条書きを含める\n"
+                ),
+                stub_text=(
+                    f"# Low Draft\n\nモデル: {model_name}\n\n"
+                    f"タスク:\n{run.task_prompt}\n\n- 下書き項目1\n- 下書き項目2\n"
+                ),
+                temperature=0.3,
+                max_tokens=1200,
+            )
+            if not generated_text.lstrip().startswith("#"):
+                generated_text = f"# Low Draft\n\n{generated_text}"
             artifact = create_artifact(
                 db,
                 run_uuid,
                 ArtifactKind.low_draft,
                 ArtifactFormat.markdown,
-                content_text=(
-                    f"# Low Draft\n\nModel: {(model_cfg or {}).get('model', settings.model_low)}\n\n"
-                    f"Prompt:\n{run.task_prompt}\n\n- Draft bullet 1\n- Draft bullet 2\n"
-                ),
+                content_text=generated_text,
             )
             run.status = RunStatus.running
             return {"artifact_id": str(artifact.id)}
@@ -590,48 +818,87 @@ def search_chunks(
         ).output_ref
 
 
-@celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, retry_kwargs={"max_retries": 3})
-def generate_feedback_with_citations(self, run_id: str, target_artifact_id: str) -> Dict[str, Any]:
+@celery_app.task(bind=True, autoretry_for=(RuntimeError,), retry_backoff=True, retry_kwargs={"max_retries": 3})
+def generate_feedback_with_citations(
+    self,
+    run_id: str,
+    target_artifact_id: str,
+    model_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     run_uuid = uuid.UUID(run_id)
     target_uuid = uuid.UUID(target_artifact_id)
     stage_name = "generate_feedback_with_citations"
-    idempotency_key = stage_idempotency_key(
-        run_id=run_id,
-        stage_name=stage_name,
-        stage_input_fingerprint={"target_artifact_id": target_artifact_id},
-    )
 
     with session_scope() as db:
         get_run_or_raise(db, run_uuid)
+        target = db.get(Artifact, target_uuid)
+        if target is None:
+            raise ValueError("target artifact not found")
+        selected_chunk = (
+            db.query(SourceChunk, SourceDoc)
+            .join(SourceDoc, SourceChunk.source_doc_id == SourceDoc.id)
+            .filter(SourceDoc.run_id == run_uuid)
+            .order_by(SourceChunk.chunk_index.asc())
+            .first()
+        )
+        idempotency_key = stage_idempotency_key(
+            run_id=run_id,
+            stage_name=stage_name,
+            stage_input_fingerprint={
+                "target_artifact_id": target_artifact_id,
+                "target_artifact_fp": artifact_ref_fingerprint(target),
+                "source_chunk_fp": source_chunk_fingerprint(db, run_uuid),
+                "selected_chunk_id": str(selected_chunk[0].id) if selected_chunk else "none",
+            },
+            model_cfg=model_cfg or {},
+        )
 
         def work() -> Dict[str, Any]:
-            target = db.get(Artifact, target_uuid)
-            if target is None:
-                raise ValueError("target artifact not found")
-
-            chunk = (
-                db.query(SourceChunk, SourceDoc)
-                .join(SourceDoc, SourceChunk.source_doc_id == SourceDoc.id)
-                .filter(SourceDoc.run_id == run_uuid)
-                .order_by(SourceChunk.chunk_index.asc())
-                .first()
-            )
+            chunk = selected_chunk
             if chunk is None:
                 raise StageFailureError(
-                    "no source chunk found for citation-backed feedback",
+                    "根拠付きフィードバック生成に必要な根拠チャンクがありません",
                     failure_type=StageFailureType.evidence_insufficient,
                     failure_detail={
                         "run_id": str(run_uuid),
                         "required": "source_chunk",
-                        "summary": "source chunk is required before citation-backed feedback can run",
+                        "summary": "根拠チャンクがないため根拠付きフィードバックを生成できません",
                     },
                 )
 
             source_chunk, source_doc = chunk
+            model_name = (model_cfg or {}).get("model", settings.model_low)
+            generated_feedback = llm_text_or_stub(
+                model=model_name,
+                system_prompt=(
+                    "あなたはレビュー担当者です。"
+                    "提示された根拠に直接結びつく、具体的で実行可能な改善指摘を日本語で1文だけ返してください。"
+                ),
+                user_prompt=(
+                    "対象ドラフト抜粋:\n"
+                    f"{(target.content_text or '')[:1600]}\n\n"
+                    "根拠抜粋:\n"
+                    f"{(source_chunk.text or '')[:1200]}\n\n"
+                    "制約:\n"
+                    "- 必ず1文のみ\n"
+                    "- 何を追記/修正/明確化するかを明示\n"
+                ),
+                stub_text="根拠文書に照らして、主張の具体例を1つ追加してください。",
+                temperature=0.2,
+                max_tokens=220,
+            )
+            feedback_text = re.sub(r"\s+", " ", generated_feedback).strip()
+            if not feedback_text:
+                raise StageFailureError(
+                    "フィードバック生成結果が空です",
+                    failure_type=StageFailureType.system_error,
+                    failure_detail={"summary": "feedback generation が空文字を返しました"},
+                )
+            feedback_text = feedback_text[:400]
             feedback = FeedbackItem(
                 run_id=run_uuid,
                 target_artifact_id=target.id,
-                text="根拠文書に照らして、主張の具体例を1つ追加してください。",
+                text=feedback_text,
                 category="evidence",
                 severity=2,
             )
@@ -649,11 +916,11 @@ def generate_feedback_with_citations(self, run_id: str, target_artifact_id: str)
             citation_count = db.query(Citation).filter(Citation.feedback_id == feedback.id).count()
             if citation_count < 1:
                 raise StageFailureError(
-                    "feedback must include at least one citation",
+                    "フィードバックには最低1件の引用が必要です",
                     failure_type=StageFailureType.evidence_insufficient,
                     failure_detail={
                         "feedback_id": str(feedback.id),
-                        "summary": "feedback generation completed without any citation",
+                        "summary": "フィードバック生成は完了しましたが引用が0件でした",
                     },
                 )
 
@@ -668,38 +935,80 @@ def generate_feedback_with_citations(self, run_id: str, target_artifact_id: str)
         ).output_ref
 
 
-@celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, retry_kwargs={"max_retries": 3})
-def apply_feedback(self, run_id: str, base_artifact_id: str) -> Dict[str, Any]:
+@celery_app.task(bind=True, autoretry_for=(RuntimeError,), retry_backoff=True, retry_kwargs={"max_retries": 3})
+def apply_feedback(
+    self,
+    run_id: str,
+    base_artifact_id: str,
+    model_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     run_uuid = uuid.UUID(run_id)
     base_uuid = uuid.UUID(base_artifact_id)
     stage_name = "apply_feedback"
-    idempotency_key = stage_idempotency_key(
-        run_id=run_id,
-        stage_name=stage_name,
-        stage_input_fingerprint={"base_artifact_id": base_artifact_id},
-    )
 
     with session_scope() as db:
         get_run_or_raise(db, run_uuid)
+        base = db.get(Artifact, base_uuid)
+        if base is None:
+            raise ValueError("base artifact not found")
+        feedbacks = (
+            db.query(FeedbackItem)
+            .filter(FeedbackItem.run_id == run_uuid, FeedbackItem.target_artifact_id == base.id)
+            .order_by(FeedbackItem.created_at.asc(), FeedbackItem.id.asc())
+            .all()
+        )
+        idempotency_key = stage_idempotency_key(
+            run_id=run_id,
+            stage_name=stage_name,
+            stage_input_fingerprint={
+                "base_artifact_id": base_artifact_id,
+                "base_artifact_fp": artifact_ref_fingerprint(base),
+                "feedback_fp": feedback_rows_fingerprint(feedbacks),
+                "feedback_count": len(feedbacks),
+            },
+            model_cfg=model_cfg or {},
+        )
 
         def work() -> Dict[str, Any]:
-            base = db.get(Artifact, base_uuid)
-            if base is None:
-                raise ValueError("base artifact not found")
-
-            feedbacks = (
-                db.query(FeedbackItem)
-                .filter(FeedbackItem.run_id == run_uuid, FeedbackItem.target_artifact_id == base.id)
-                .all()
+            model_name = (model_cfg or {}).get("model", settings.model_low)
+            base_text = base.content_text or ""
+            feedback_context = collect_feedback_context(db, feedbacks)
+            generated_text = llm_text_or_stub(
+                model=model_name,
+                system_prompt=(
+                    "あなたは編集者です。"
+                    "ベース原稿に対して、提示されたフィードバックを自然に反映した改稿版を日本語で作成してください。"
+                    "内容の整合性と根拠性を保ち、冗長な重複を避けてください。"
+                ),
+                user_prompt=(
+                    "ベース原稿:\n"
+                    f"{base_text[:7000]}\n\n"
+                    "反映対象フィードバック:\n"
+                    f"{feedback_context}\n\n"
+                    "出力要件:\n"
+                    "- Markdownのみ\n"
+                    "- 先頭は '# Improved Draft' で開始\n"
+                    "- 既存構成をできるだけ維持しつつ改善を反映\n"
+                    "- 末尾に「## 反映メモ」を置き、反映した指摘を箇条書きで要約\n"
+                ),
+                stub_text=(
+                    "# Improved Draft\n\n"
+                    f"{base_text}\n\n"
+                    "## 反映メモ\n"
+                    + ("\n".join(f"- {fb.text}" for fb in feedbacks) if feedbacks else "- 反映対象のフィードバックはありません")
+                    + "\n"
+                ),
+                temperature=0.2,
+                max_tokens=1800,
             )
-            applied_lines = [f"- {fb.text}" for fb in feedbacks]
-            improved_text = (base.content_text or "") + "\n\n## Improvements from Feedback\n" + "\n".join(applied_lines)
+            if not generated_text.lstrip().startswith("#"):
+                generated_text = f"# Improved Draft\n\n{generated_text}"
             artifact = create_artifact(
                 db,
                 run_uuid,
                 ArtifactKind.improved,
                 ArtifactFormat.markdown,
-                content_text=improved_text,
+                content_text=generated_text,
             )
             return {"artifact_id": str(artifact.id)}
 
@@ -712,37 +1021,60 @@ def apply_feedback(self, run_id: str, base_artifact_id: str) -> Dict[str, Any]:
         ).output_ref
 
 
-@celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, retry_kwargs={"max_retries": 3})
+@celery_app.task(bind=True, autoretry_for=(RuntimeError,), retry_backoff=True, retry_kwargs={"max_retries": 3})
 def generate_high_final(self, run_id: str, model_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     run_uuid = uuid.UUID(run_id)
     stage_name = "generate_high_final"
-    idempotency_key = stage_idempotency_key(
-        run_id=run_id,
-        stage_name=stage_name,
-        stage_input_fingerprint={"task": "high_final"},
-        model_cfg=model_cfg or {},
-    )
 
     with session_scope() as db:
         run = get_run_or_raise(db, run_uuid)
+        idempotency_key = stage_idempotency_key(
+            run_id=run_id,
+            stage_name=stage_name,
+            stage_input_fingerprint={
+                "task": "high_oneshot",
+                "task_prompt": hash_key(run.task_prompt or ""),
+                "source_chunk_fp": source_chunk_fingerprint(db, run_uuid),
+            },
+            model_cfg=model_cfg or {},
+        )
 
         def work() -> Dict[str, Any]:
-            source = (
-                db.query(Artifact)
-                .filter(Artifact.run_id == run_uuid, Artifact.kind == ArtifactKind.improved)
-                .order_by(Artifact.created_at.desc())
-                .first()
+            model_name = (model_cfg or {}).get("model", settings.model_high)
+            source_context = collect_source_context(db, run_uuid)
+            generated_text = llm_text_or_stub(
+                model=model_name,
+                system_prompt=(
+                    "あなたはシニアエディタです。"
+                    "与えられたタスクと根拠のみを使って、一発で完成度の高い日本語ドラフトを作成してください。"
+                    "構成は読み手が比較しやすいように見出しと箇条書きを含めてください。"
+                ),
+                user_prompt=(
+                    "タスク:\n"
+                    f"{(run.task_prompt or '')[:5000]}\n\n"
+                    "根拠スニペット:\n"
+                    f"{source_context}\n\n"
+                    "出力要件:\n"
+                    "- Markdownのみ\n"
+                    "- 先頭は '# High One-shot' で開始\n"
+                    "- 具体的で判断可能な表現を維持\n"
+                ),
+                stub_text=(
+                    f"# High One-shot\n\nモデル: {model_name}\n\n"
+                    f"タスク:\n{run.task_prompt}\n\n"
+                    "## 要点\n- 根拠に基づく一発生成のドラフトです。\n"
+                ),
+                temperature=0.2,
+                max_tokens=1600,
             )
-            body = source.content_text if source else run.task_prompt
+            if not generated_text.lstrip().startswith("#"):
+                generated_text = f"# High One-shot\n\n{generated_text}"
             artifact = create_artifact(
                 db,
                 run_uuid,
                 ArtifactKind.high_final,
                 ArtifactFormat.markdown,
-                content_text=(
-                    f"# High Final\n\nModel: {(model_cfg or {}).get('model', settings.model_high)}\n\n"
-                    f"{body}\n\n## Final polish\n- Added concise summary.\n"
-                ),
+                content_text=generated_text,
             )
             run.status = RunStatus.running
             return {"artifact_id": str(artifact.id)}
@@ -839,9 +1171,17 @@ def run_full_pipeline(self, run_id: str, model_low: Optional[str] = None, model_
     low_result = generate_low_draft.run(run_id, {"model": model_low or settings.model_low})
     low_artifact_id = low_result["artifact_id"]
 
-    feedback_result = generate_feedback_with_citations.run(run_id, low_artifact_id)
+    feedback_result = generate_feedback_with_citations.run(
+        run_id,
+        low_artifact_id,
+        {"model": model_high or settings.model_high},
+    )
 
-    improved_result = apply_feedback.run(run_id, low_artifact_id)
+    improved_result = apply_feedback.run(
+        run_id,
+        low_artifact_id,
+        {"model": model_low or settings.model_low},
+    )
     improved_artifact_id = improved_result["artifact_id"]
 
     high_result = generate_high_final.run(run_id, {"model": model_high or settings.model_high})
@@ -930,6 +1270,7 @@ def run_full_pipeline(self, run_id: str, model_low: Optional[str] = None, model_
         "feedback_id": feedback_result["feedback_id"],
         "improved_artifact_id": improved_artifact_id,
         "high_artifact_id": high_artifact_id,
+        "high_oneshot_artifact_id": high_artifact_id,
         "diff_artifact_id": span_result["artifact_id"],
         "issue_count": issue_result["issue_count"],
         "issue_with_evidence_count": evidence_result["issue_with_evidence_count"],
@@ -974,26 +1315,34 @@ def detect_change_spans(
             for idx, span in enumerate(low_vs_improved):
                 if span["status"] == "unchanged":
                     continue
+                before_raw = multiline_excerpt(span.get("a_text", ""))
+                after_raw = multiline_excerpt(span.get("b_text", ""))
                 spans.append(
                     {
                         "span_id": f"li-{idx + 1}",
                         "phase": "low_to_improved",
                         "status": span["status"],
-                        "before_excerpt": excerpt(span.get("a_text", "")),
-                        "after_excerpt": excerpt(span.get("b_text", "")),
+                        "before_excerpt": before_raw,
+                        "after_excerpt": after_raw,
+                        "before_preview": excerpt(before_raw),
+                        "after_preview": excerpt(after_raw),
                         "score": float(span.get("score", 0.0)),
                     }
                 )
             for idx, span in enumerate(improved_vs_high):
                 if span["status"] == "unchanged":
                     continue
+                before_raw = multiline_excerpt(span.get("a_text", ""))
+                after_raw = multiline_excerpt(span.get("b_text", ""))
                 spans.append(
                     {
                         "span_id": f"ih-{idx + 1}",
                         "phase": "improved_to_high",
                         "status": span["status"],
-                        "before_excerpt": excerpt(span.get("a_text", "")),
-                        "after_excerpt": excerpt(span.get("b_text", "")),
+                        "before_excerpt": before_raw,
+                        "after_excerpt": after_raw,
+                        "before_preview": excerpt(before_raw),
+                        "after_preview": excerpt(after_raw),
                         "score": float(span.get("score", 0.0)),
                     }
                 )
@@ -1063,6 +1412,8 @@ def derive_issues_from_changes(self, run_id: str) -> Dict[str, Any]:
                 }.get(status, "論点候補")
                 before_excerpt = span.get("before_excerpt") or ""
                 after_excerpt = span.get("after_excerpt") or ""
+                before_preview = span.get("before_preview") or excerpt(before_excerpt)
+                after_preview = span.get("after_preview") or excerpt(after_excerpt)
                 severity = 3 if status in {"modified", "removed"} else 2
                 confidence = min(0.99, max(0.4, float(span.get("score", 0.5))))
                 phase = span.get("phase", "")
@@ -1094,9 +1445,18 @@ def derive_issues_from_changes(self, run_id: str) -> Dict[str, Any]:
                         best_group["after_excerpt"] = after_excerpt
                     if len(before_excerpt) > len(best_group["before_excerpt"]):
                         best_group["before_excerpt"] = before_excerpt
-                    best_group["summary"] = (
-                        f"{best_group['title_prefix']}: "
-                        f"{best_group['after_excerpt'] or best_group['before_excerpt']}"
+                    if len(after_preview) > len(best_group["after_preview"]):
+                        best_group["after_preview"] = after_preview
+                    if len(before_preview) > len(best_group["before_preview"]):
+                        best_group["before_preview"] = before_preview
+                    best_group["title"] = issue_title_from_span(
+                        status=best_group["status"],
+                        before_text=best_group["before_excerpt"],
+                        after_text=best_group["after_excerpt"],
+                    )
+                    best_group["summary"] = issue_summary_from_span(
+                        before_preview=best_group["before_preview"],
+                        after_preview=best_group["after_preview"],
                     )
                     continue
 
@@ -1105,11 +1465,21 @@ def derive_issues_from_changes(self, run_id: str) -> Dict[str, Any]:
                         "phase": phase,
                         "status": status,
                         "title_prefix": title_prefix,
-                        "summary": f"{title_prefix}: {after_excerpt or before_excerpt}",
+                        "title": issue_title_from_span(
+                            status=status,
+                            before_text=before_excerpt,
+                            after_text=after_excerpt,
+                        ),
+                        "summary": issue_summary_from_span(
+                            before_preview=before_preview,
+                            after_preview=after_preview,
+                        ),
                         "severity": severity,
                         "confidence": confidence,
                         "before_excerpt": before_excerpt,
                         "after_excerpt": after_excerpt,
+                        "before_preview": before_preview,
+                        "after_preview": after_preview,
                         "primary_span_id": span.get("span_id"),
                         "span_ids": [span.get("span_id")],
                         "gram_set": gram_set,
@@ -1130,7 +1500,7 @@ def derive_issues_from_changes(self, run_id: str) -> Dict[str, Any]:
                     Issue(
                         run_id=run_uuid,
                         fingerprint=fingerprint[:120],
-                        title=f"{group['title_prefix']} #{group_idx}",
+                        title=(group.get("title") or f"{group['title_prefix']} #{group_idx}")[:255],
                         summary=(group["summary"] or "")[:2000],
                         severity=group["severity"],
                         confidence=group["confidence"],
@@ -1141,6 +1511,8 @@ def derive_issues_from_changes(self, run_id: str) -> Dict[str, Any]:
                             "status": group["status"],
                             "before_excerpt": group["before_excerpt"],
                             "after_excerpt": group["after_excerpt"],
+                            "before_preview": group.get("before_preview", ""),
+                            "after_preview": group.get("after_preview", ""),
                             "merged_span_ids": [sid for sid in group["span_ids"] if sid][:50],
                             "dedup_count": group["dedup_count"],
                             "fingerprint_basis": {

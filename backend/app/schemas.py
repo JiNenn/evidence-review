@@ -30,6 +30,7 @@ class AuthTokenRequest(BaseModel):
 class AuthTokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    roles: List[str] = Field(default_factory=list)
 
 
 class RunResponse(BaseModel):
@@ -41,6 +42,16 @@ class RunResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class RunListItemResponse(BaseModel):
+    id: uuid.UUID
+    created_at: datetime
+    title: str
+    status: RunStatus
+    source_count: int
+    issue_count: int
+    visible_issue_count: int
 
 
 class ArtifactResponse(BaseModel):
@@ -95,6 +106,14 @@ class FeedbackResponse(BaseModel):
         from_attributes = True
 
 
+class IssueWritingGuidanceResponse(BaseModel):
+    left_point: str
+    left_example: str
+    right_point: str
+    right_example: str
+    strategy: str
+
+
 class IssueEvidenceResponse(BaseModel):
     id: uuid.UUID
     issue_id: uuid.UUID
@@ -110,6 +129,7 @@ class IssueEvidenceResponse(BaseModel):
     source_presigned_url: str
     chunk_text: str
     chunk_loc: Dict[str, Any]
+    writing_guidance: Optional[IssueWritingGuidanceResponse] = None
 
 
 class IssueResponse(BaseModel):
@@ -121,6 +141,7 @@ class IssueResponse(BaseModel):
     confidence: float
     status: IssueStatus
     evidence_count: int
+    top_evidence_score: Optional[float] = None
     created_at: datetime
     updated_at: datetime
 
@@ -136,6 +157,32 @@ class IssueDetailResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     evidences: List[IssueEvidenceResponse] = Field(default_factory=list)
+
+
+class CompareRowResponse(BaseModel):
+    row_no: int
+    kind: str
+    left_line_no: Optional[int]
+    left_text: str
+    right_line_no: Optional[int]
+    right_text: str
+
+
+class RunCompareResponse(BaseModel):
+    run_id: uuid.UUID
+    left_label: str
+    right_label: str
+    left_artifact_id: uuid.UUID
+    right_artifact_id: uuid.UUID
+    rows: List[CompareRowResponse] = Field(default_factory=list)
+
+
+class IssueCompareContextResponse(BaseModel):
+    issue_id: uuid.UUID
+    run_id: uuid.UUID
+    before_queries: List[str] = Field(default_factory=list)
+    after_queries: List[str] = Field(default_factory=list)
+    highlight_queries: List[str] = Field(default_factory=list)
 
 
 class PresignPutRequest(BaseModel):
@@ -168,6 +215,25 @@ class PresignGetResponse(BaseModel):
     object_key: str
     url: str
     method: str = "GET"
+
+
+class SourceDocSummaryResponse(BaseModel):
+    id: uuid.UUID
+    run_id: uuid.UUID
+    title: str
+    content_type: str
+    object_key: str
+    chunk_count: int
+    ingest_status: str
+    created_at: datetime
+
+
+class SourceChunkPreviewResponse(BaseModel):
+    id: uuid.UUID
+    source_doc_id: uuid.UUID
+    chunk_index: int
+    text_excerpt: str
+    loc: Dict[str, Any]
 
 
 class PipelineRequest(BaseModel):
@@ -230,3 +296,53 @@ class RunStageResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class RunStageAttemptResponse(BaseModel):
+    id: uuid.UUID
+    run_stage_id: uuid.UUID
+    run_id: uuid.UUID
+    stage_name: str
+    attempt_no: int
+    status: StageStatus
+    failure_type: Optional[StageFailureType]
+    failure_detail: Optional[Dict[str, Any]]
+    output_ref: Optional[Dict[str, Any]]
+    started_at: datetime
+    finished_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class ScoreHistogramBucket(BaseModel):
+    range_start: float
+    range_end: float
+    count: int
+
+
+class SelectionScoreSummary(BaseModel):
+    count: int
+    avg: Optional[float]
+    min: Optional[float]
+    max: Optional[float]
+    p50: Optional[float]
+    p90: Optional[float]
+    histogram: List[ScoreHistogramBucket] = Field(default_factory=list)
+
+
+class RetrySummary(BaseModel):
+    retried_stage_count: int
+    retry_success_count: int
+    retry_failure_count: int
+    retry_success_rate: Optional[float]
+
+
+class RunMetricsResponse(BaseModel):
+    run_id: uuid.UUID
+    issue_total: int
+    visible_issue_count: int
+    hidden_issue_count: int
+    hidden_rate: float
+    selection_score: SelectionScoreSummary
+    retry: RetrySummary

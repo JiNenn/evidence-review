@@ -230,6 +230,7 @@
 * Workerは開始時に「既にsuccessなら即return」する。
 * `stage_name` は分類用であり、同一 `run_id` 内で複数行を許容する（入力が異なる再実行を許可）
 * `attempt` は **同一 `idempotency_key` に対する試行回数** とする（再試行は同一行を更新）
+* 監査用途の明細として `run_stage_attempts` を持ち、`attempt_no` 単位の履歴を保持する
 
 ### 5.6 SearchRequest / SearchResult（探索の永続化）
 
@@ -265,16 +266,23 @@
 ### 6.1 認証
 
 * v0.1：JWTベース（Self-hostで扱いやすい）
-* すべてENVで設定（秘密鍵/有効期限）
+* すべてENVで設定（秘密鍵/有効期限/ユーザー定義）
+* `AUTH_USERS_JSON` で `username/password/roles` を定義し、監査導線は `audit` または `admin` ロールで制御する
 * 認証トークン発行：`POST /auth/token`
+* UI挙動契約：
+  * `401` は未認証としてログイン導線へ遷移
+  * `403` は認証済み権限不足として、画面に説明を表示（ログイン遷移しない）
 
 ### 6.2 主要エンドポイント
 
 * Runs
 
+  * `GET /runs`（公開メタ一覧）
   * `POST /runs`（run作成）
   * `GET /runs/{run_id}`（run取得）
   * `GET /runs/{run_id}/stages`（stage状態/失敗理由の取得）
+  * `GET /runs/{run_id}/stage-attempts`（stage試行履歴の取得）
+  * `GET /runs/{run_id}/metrics`（hidden率 / selectionスコア分布 / retry成功率）
   * `GET /runs/{run_id}/issues`（主導API）
   * `GET /runs/{run_id}/issues?include_hidden=true`（監査/デバッグ用、権限制御あり）
   * `GET /runs/{run_id}/audit/issues`（監査UI向け、hidden含む）
@@ -302,6 +310,19 @@
 
   * `GET /healthz`
   * `GET /readyz`（DB/Redis/MinIO接続確認）
+
+### 6.3 Frontend復旧導線契約
+
+* 画面構成は `Home(/)` / `Run詳細(/runs/{run_id})` / `Debug(/debug)` を分離する
+* `blocked_evidence` の Run 詳細には `Debugで復旧` ボタンを表示する
+* Debug 遷移時は `run_id` と `return_to`（元ページ相対URL）を渡す
+* `return_to` はアプリ内相対パスのみ許可し、外部URLは無効化する
+* Debug は復旧専用画面とし、Debug固有のトークン取得フォームは置かない
+* 復旧実行後は `run.status` を監視し、
+  * `success` / `success_partial`：自動復帰対象
+  * `blocked_evidence` / `failed_system`：Debugに残留
+* 自動復帰前に「3秒後に戻る（今すぐ戻る/Debugに残る）」の選択を表示する
+* 失敗残留時は `failure_detail.summary` と次アクションを表示する
 
 ---
 
@@ -393,6 +414,10 @@
 * ログ：stdoutへJSON
 
   * `timestamp, service, level, run_id, stage, msg, extra`
+* run metrics API：
+  * `hidden_rate`
+  * `selection_score`（avg/p50/p90/histogram）
+  * `retry`（retried_stage_count / retry_success_rate）
 * Health
 
   * `/healthz`：プロセス生存のみ
@@ -421,6 +446,7 @@
 * `SOURCE_DOC_ORPHAN_TTL_HOURS`
 * `JWT_SECRET, JWT_EXPIRES_IN`
 * `AUTH_ENABLED, AUTH_DEV_USER, AUTH_DEV_PASSWORD`
+* `AUTH_USERS_JSON`（roleベース認可定義）
 * `LLM_PROVIDER, LLM_API_KEY, MODEL_HIGH, MODEL_LOW`（キーはSecrets扱い）
 * `ISSUE_DEDUP_SIMILARITY_THRESHOLD`
 

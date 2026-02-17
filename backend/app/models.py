@@ -258,6 +258,35 @@ class RunStage(Base):
     output_ref: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     run = relationship("Run", back_populates="run_stages")
+    attempts = relationship("RunStageAttempt", back_populates="run_stage", cascade="all, delete-orphan")
+
+
+class RunStageAttempt(Base):
+    __tablename__ = "run_stage_attempts"
+    __table_args__ = (
+        UniqueConstraint("run_stage_id", "attempt_no", name="uq_run_stage_attempts_stage_attempt_no"),
+        Index("ix_run_stage_attempts_run_stage", "run_id", "stage_name", "started_at"),
+        Index("ix_run_stage_attempts_stage_attempt", "run_stage_id", "attempt_no"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_stage_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("run_stages.id", ondelete="CASCADE"), nullable=False
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("runs.id", ondelete="CASCADE"), nullable=False)
+    stage_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[StageStatus] = mapped_column(Enum(StageStatus, name="stage_status"), nullable=False)
+    failure_type: Mapped[StageFailureType | None] = mapped_column(
+        Enum(StageFailureType, name="stage_failure_type"),
+        nullable=True,
+    )
+    failure_detail: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    output_ref: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    run_stage = relationship("RunStage", back_populates="attempts")
 
 
 class SearchRequest(Base):

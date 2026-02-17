@@ -22,11 +22,14 @@ class Settings(BaseSettings):
     jwt_secret: str = "replace-with-strong-secret"
     jwt_expires_in: int = 3600
     auth_enabled: bool = False
+    auth_users_json: str = ""
     auth_dev_user: str = "admin"
     auth_dev_password: str = "admin"
 
     llm_provider: str = "stub"
     llm_api_key: str = ""
+    llm_base_url: str = "https://api.openai.com/v1"
+    llm_timeout_seconds: int = 60
     model_high: str = "high-stub-v1"
     model_low: str = "low-stub-v1"
 
