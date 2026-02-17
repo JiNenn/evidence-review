@@ -1412,8 +1412,6 @@ def derive_issues_from_changes(self, run_id: str) -> Dict[str, Any]:
                 }.get(status, "論点候補")
                 before_excerpt = span.get("before_excerpt") or ""
                 after_excerpt = span.get("after_excerpt") or ""
-                before_preview = span.get("before_preview") or excerpt(before_excerpt)
-                after_preview = span.get("after_preview") or excerpt(after_excerpt)
                 severity = 3 if status in {"modified", "removed"} else 2
                 confidence = min(0.99, max(0.4, float(span.get("score", 0.5))))
                 phase = span.get("phase", "")
@@ -1445,18 +1443,9 @@ def derive_issues_from_changes(self, run_id: str) -> Dict[str, Any]:
                         best_group["after_excerpt"] = after_excerpt
                     if len(before_excerpt) > len(best_group["before_excerpt"]):
                         best_group["before_excerpt"] = before_excerpt
-                    if len(after_preview) > len(best_group["after_preview"]):
-                        best_group["after_preview"] = after_preview
-                    if len(before_preview) > len(best_group["before_preview"]):
-                        best_group["before_preview"] = before_preview
-                    best_group["title"] = issue_title_from_span(
-                        status=best_group["status"],
-                        before_text=best_group["before_excerpt"],
-                        after_text=best_group["after_excerpt"],
-                    )
-                    best_group["summary"] = issue_summary_from_span(
-                        before_preview=best_group["before_preview"],
-                        after_preview=best_group["after_preview"],
+                    best_group["summary"] = (
+                        f"{best_group['title_prefix']}: "
+                        f"{best_group['after_excerpt'] or best_group['before_excerpt']}"
                     )
                     continue
 
@@ -1465,21 +1454,11 @@ def derive_issues_from_changes(self, run_id: str) -> Dict[str, Any]:
                         "phase": phase,
                         "status": status,
                         "title_prefix": title_prefix,
-                        "title": issue_title_from_span(
-                            status=status,
-                            before_text=before_excerpt,
-                            after_text=after_excerpt,
-                        ),
-                        "summary": issue_summary_from_span(
-                            before_preview=before_preview,
-                            after_preview=after_preview,
-                        ),
+                        "summary": f"{title_prefix}: {after_excerpt or before_excerpt}",
                         "severity": severity,
                         "confidence": confidence,
                         "before_excerpt": before_excerpt,
                         "after_excerpt": after_excerpt,
-                        "before_preview": before_preview,
-                        "after_preview": after_preview,
                         "primary_span_id": span.get("span_id"),
                         "span_ids": [span.get("span_id")],
                         "gram_set": gram_set,
@@ -1500,7 +1479,7 @@ def derive_issues_from_changes(self, run_id: str) -> Dict[str, Any]:
                     Issue(
                         run_id=run_uuid,
                         fingerprint=fingerprint[:120],
-                        title=(group.get("title") or f"{group['title_prefix']} #{group_idx}")[:255],
+                        title=f"{group['title_prefix']} #{group_idx}",
                         summary=(group["summary"] or "")[:2000],
                         severity=group["severity"],
                         confidence=group["confidence"],
@@ -1511,8 +1490,6 @@ def derive_issues_from_changes(self, run_id: str) -> Dict[str, Any]:
                             "status": group["status"],
                             "before_excerpt": group["before_excerpt"],
                             "after_excerpt": group["after_excerpt"],
-                            "before_preview": group.get("before_preview", ""),
-                            "after_preview": group.get("after_preview", ""),
                             "merged_span_ids": [sid for sid in group["span_ids"] if sid][:50],
                             "dedup_count": group["dedup_count"],
                             "fingerprint_basis": {
