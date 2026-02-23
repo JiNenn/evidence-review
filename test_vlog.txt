@@ -1,0 +1,50 @@
+def chunk_text(text: str, chunk_size: int = 800, overlap: int = 120) -> List[Dict[str, Any]]:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return []
+
+    chunks: List[Dict[str, Any]] = []
+    start = 0
+    while start < len(normalized):
+        end = min(start + chunk_size, len(normalized))
+        if end < len(normalized):
+            split = normalized.rfind("\n", start, end)
+            if split > start + 120:
+                end = split
+        piece = normalized[start:end].strip()
+        if piece:
+            chunks.append({"text": piece, "loc": {"start_offset": start, "end_offset": end}})
+        if end >= len(normalized):
+            break
+        start = max(end - overlap, start + 1)
+    return chunks
+
+
+def artifact_version(db, run_id: uuid.UUID, kind: ArtifactKind) -> int:
+    max_version = (
+        db.query(func.max(Artifact.version))
+        .filter(Artifact.run_id == run_id, Artifact.kind == kind)
+        .scalar()
+    )
+    return (max_version or 0) + 1
+
+
+def create_artifact(
+    db,
+    run_id: uuid.UUID,
+    kind: ArtifactKind,
+    format_: ArtifactFormat,
+    content_text: Optional[str] = None,
+    content_object_key: Optional[str] = None,
+) -> Artifact:
+    item = Artifact(
+        run_id=run_id,
+        kind=kind,
+        format=format_,
+        content_text=content_text,
+        content_object_key=content_object_key,
+        version=artifact_version(db, run_id, kind),
+    )
+    db.add(item)
+    db.flush()
+    return item

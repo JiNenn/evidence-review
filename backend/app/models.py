@@ -17,6 +17,11 @@ class RunStatus(str, enum.Enum):
     pending = "pending"
     running = "running"
     success = "success"
+    success_partial = "success_partial"
+    blocked_evidence = "blocked_evidence"
+    failed_system = "failed_system"
+    failed_legacy = "failed_legacy"
+    # legacy DB compatibility; API should normalize this to failed_legacy.
     failed = "failed"
 
 
@@ -38,6 +43,12 @@ class StageStatus(str, enum.Enum):
     running = "running"
     success = "success"
     failed = "failed"
+
+
+class StageFailureType(str, enum.Enum):
+    system_error = "system_error"
+    evidence_insufficient = "evidence_insufficient"
+    validation_error = "validation_error"
 
 
 class SourceOrigin(str, enum.Enum):
@@ -216,7 +227,7 @@ class IssueEvidence(Base):
     )
     before_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
     after_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
-    loc: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    loc: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
 
     issue = relationship("Issue", back_populates="evidences")
@@ -226,9 +237,9 @@ class IssueEvidence(Base):
 class RunStage(Base):
     __tablename__ = "run_stages"
     __table_args__ = (
-        UniqueConstraint("run_id", "stage_name", name="uq_run_stages_run_stage"),
         UniqueConstraint("idempotency_key", name="uq_run_stages_idempotency_key"),
         Index("ix_run_stages_run_status", "run_id", "status"),
+        Index("ix_run_stages_run_stage_name", "run_id", "stage_name"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -236,12 +247,46 @@ class RunStage(Base):
     stage_name: Mapped[str] = mapped_column(String(128), nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[StageStatus] = mapped_column(Enum(StageStatus, name="stage_status"), nullable=False, default=StageStatus.pending)
+    failure_type: Mapped[StageFailureType | None] = mapped_column(
+        Enum(StageFailureType, name="stage_failure_type"),
+        nullable=True,
+    )
+    failure_detail: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     output_ref: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     run = relationship("Run", back_populates="run_stages")
+    attempts = relationship("RunStageAttempt", back_populates="run_stage", cascade="all, delete-orphan")
+
+
+class RunStageAttempt(Base):
+    __tablename__ = "run_stage_attempts"
+    __table_args__ = (
+        UniqueConstraint("run_stage_id", "attempt_no", name="uq_run_stage_attempts_stage_attempt_no"),
+        Index("ix_run_stage_attempts_run_stage", "run_id", "stage_name", "started_at"),
+        Index("ix_run_stage_attempts_stage_attempt", "run_stage_id", "attempt_no"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_stage_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("run_stages.id", ondelete="CASCADE"), nullable=False
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("runs.id", ondelete="CASCADE"), nullable=False)
+    stage_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[StageStatus] = mapped_column(Enum(StageStatus, name="stage_status"), nullable=False)
+    failure_type: Mapped[StageFailureType | None] = mapped_column(
+        Enum(StageFailureType, name="stage_failure_type"),
+        nullable=True,
+    )
+    failure_detail: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    output_ref: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    run_stage = relationship("RunStage", back_populates="attempts")
 
 
 class SearchRequest(Base):

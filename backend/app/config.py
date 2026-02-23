@@ -17,15 +17,19 @@ class Settings(BaseSettings):
     s3_secret_key: str = "minioadmin"
     s3_bucket: str = "diffui"
     s3_presign_expires: int = 900
+    source_doc_orphan_ttl_hours: int = 24
 
     jwt_secret: str = "replace-with-strong-secret"
     jwt_expires_in: int = 3600
     auth_enabled: bool = False
+    auth_users_json: str = ""
     auth_dev_user: str = "admin"
     auth_dev_password: str = "admin"
 
     llm_provider: str = "stub"
     llm_api_key: str = ""
+    llm_base_url: str = "https://api.openai.com/v1"
+    llm_timeout_seconds: int = 60
     model_high: str = "high-stub-v1"
     model_low: str = "low-stub-v1"
 
@@ -33,6 +37,8 @@ class Settings(BaseSettings):
 
     celery_broker_url: str = "redis://redis:6379/0"
     celery_result_backend: str = "redis://redis:6379/1"
+
+    issue_dedup_similarity_threshold: float = 0.88
 
     @property
     def cors_origins_list(self) -> List[str]:

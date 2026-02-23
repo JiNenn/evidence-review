@@ -1,4 +1,5 @@
 import boto3
+from botocore.exceptions import ClientError
 from botocore.client import Config
 
 from app.config import get_settings
@@ -47,6 +48,18 @@ def get_object_bytes(object_key: str) -> bytes:
     client = get_s3_client()
     response = client.get_object(Bucket=settings.s3_bucket, Key=object_key)
     return response["Body"].read()
+
+
+def object_exists(object_key: str) -> bool:
+    client = get_s3_client()
+    try:
+        client.head_object(Bucket=settings.s3_bucket, Key=object_key)
+        return True
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return False
+        raise
 
 
 def put_object_bytes(object_key: str, payload: bytes, content_type: str = "application/octet-stream") -> None:
