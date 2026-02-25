@@ -1,98 +1,57 @@
-# diffUI v0.2 scaffold
+# diffUI
 
-`SPEC.md` に基づいた Self-Host First の最小実装です。  
-Compose を正本として、以下のサービスを起動します。
+AIエージェントの成果物レビューを、  
+「完成品を見る作業」から「判断に必要な論点を扱う作業」に変えるためのプロジェクトです。
 
-- `frontend` (Next.js)
-- `api` (FastAPI)
-- `worker` (Celery)
-- `postgres`
-- `redis`
-- `minio`
-- `migrate` (Alembic one-shot)
+## README構成
 
-## Quickstart
+1. 背景
+2. 何を比較するか
+3. なぜこのUXなのか
+4. 設計思想
+5. 参照ドキュメント
 
-```bash
-docker compose up --build
-```
+## 1. 背景
 
-## CI
+質の高いAIエージェントほど、最終アウトプットは良くても過程がブラックボックスになりやすく、  
+人間が思考過程や根拠を追い切る負担が大きくなります。
 
-- GitHub Actions: `.github/workflows/ci.yml`
-- `quality`:
-  - backend compile check
-  - frontend build
-- `acceptance`:
-  - `AUTH_ENABLED=false` と `AUTH_ENABLED=true` の両方で
-  - `scripts/acceptance_smoke.py` を実行
-  - 同一入力の別Runで issue-evidence 選定シグネチャが再現することも検証
+特に、参照したソースを一つずつ辿って正しさを検証する作業は重く、  
+レビュー時の判断コストを押し上げます。
 
-## Endpoints
+そのため diffUI は、次の2種類を分けて可視化することを重視します。
 
-- API docs: `http://localhost:8000/docs`
-- Frontend: `http://localhost:3000`
-- Run detail: `http://localhost:3000/runs/{run_id}`
-- Login: `http://localhost:3000/login?next=/runs/{run_id}`
-- MinIO Console: `http://localhost:9001`
-- Health: `GET /healthz`, `GET /readyz`
+- 与えられた情報を根拠として、正しさに確信を持てる部分
+- 情報不足で、まだ練り上げられていない部分
 
-## Implemented scope
+## 2. 何を比較するか
 
-- Core tables and constraints from `SPEC.md`:
-  - `runs`, `artifacts`, `feedback_items`, `citations`
-  - `issues`, `issue_evidences`
-  - `source_docs`, `source_chunks`
-  - `run_stages` (idempotency)
-  - `search_requests`, `search_results`
-- API endpoints:
-  - `GET /runs` (公開メタ一覧: title/status/counts)
-  - Runs, Issues, Source presign/ingest, Pipeline kickoff, Search, Health
-  - `GET /runs/{run_id}/stages` で stageの成否・attempt・failure_type・failure_detail・errorを確認可能
-  - `GET /runs/{run_id}/stage-attempts` で stage試行履歴（attempt_no単位）を確認可能
-  - `GET /runs/{run_id}/metrics` で hidden率・selectionスコア分布・retry成功率を取得可能
-  - `GET /runs/{run_id}/issues?include_hidden=true` は監査用途（AUTH有効時は監査権限のみ）
-  - `GET /runs/{run_id}/audit/issues` は監査UI用の専用導線（hidden含む）
-  - `POST /auth/token`（JWT発行）
-  - `POST /runs/{run_id}/sources/presign-put` は `source_doc_id/object_key` を返し、この時点で `source_docs` が作成される
-  - `POST /runs/{run_id}/sources/ingest` は `source_doc_id` 主導で実行される
-- Worker tasks:
-  - ingest, low draft, search, feedback(with citation), apply feedback, high final
-  - `apply_feedback` は feedback 群を反映した改稿をLLM生成（stub時は決定的フォールバック）
-  - detect_change_spans, derive_issues_from_changes, attach_evidence_to_issues, full pipeline
-  - `search(mode=vector)` は char n-gram cosine を使った類似度検索で実装
-  - `derive_issues_from_changes` は char n-gram Jaccard による重複統合後に `fingerprint v3` を生成
-- Citation detail:
-  - `GET /citations/{citation_id}` で根拠スニペットと原文URLを取得
-- Evidence-first rule:
-  - Issue is displayed only when evidence(s) exist
-  - `status=hidden` の issue は API/UI の一覧表示対象外
-  - evidence は `citation -> source_doc_id/chunk_id/loc` まで辿れる（`span` は任意）
-  - `GET /issues/{issue_id}` では `selection` を明示返却し、互換のため `citation.span.selection` も当面維持する
-  - `attach_evidence_to_issues` は `SearchResult.score` 重み付き（0.7）+ lexical一致度（0.3）で根拠候補を選定し、`citation.span.selection` に選定理由を残す
-  - evidence不足時は `search_chunks` を固定戦略で再実行（strict -> relaxed -> vector fallback, 最大3回）してから `blocked_evidence` 判定
+diffUI は、次の3つを同時に扱います。
 
-## Notes
+- 性能の高いモデルが作る完成版
+- 性能の低いモデルの出力を、根拠付きFBでブラッシュアップした改善版
+- FBの根拠になったソース（ワンクリックで参照可能）
 
-- LLM integration supports two modes:
-  - `LLM_PROVIDER=stub`: deterministic local stub generation (default)
-  - `LLM_PROVIDER=openai` or `openai_compatible`: calls `${LLM_BASE_URL}/chat/completions`
-- When using a non-stub provider, `LLM_API_KEY` is required.
-- `LLM_TIMEOUT_SECONDS` controls API timeout for worker-side LLM calls.
-- `ingest_source_doc` は MinIOから実データを取得し、text/json/html/pdf を抽出してチャンク化します。
-- Browserから直接S3へPUT/GETするため `S3_PUBLIC_ENDPOINT` を利用します（compose既定: `http://localhost:9000`）。
-- 認証は `AUTH_ENABLED` で有効化し、Bearer JWTでAPIを保護します。
-- AUTH有効時は `AUTH_USERS_JSON` でユーザー/ロールを定義できます（`audit` または `admin` ロールのみ hidden監査導線を利用可能）。
-- Frontend は Home(`/`) と Run詳細(`/runs/{run_id}`) を分離し、
-  `Run作成/一覧 -> 詳細遷移 -> Sourceアップロード/取り込み -> Pipeline実行 -> Issues確認` の流れで実行します。
-- Frontend 主画面は再実行操作を持たず、復旧操作は `http://localhost:3000/debug` の Run単位導線で行います。
-- Debug画面では `stage-attempts` を使って stage試行履歴を確認できます。
-- `run.status` は `success / success_partial / blocked_evidence / failed_system / failed_legacy` を区別します。
-- `attempt` は同一 `idempotency_key` に対する再試行回数です。
-- presignのみで放置された orphan `source_docs` はTTL超過時に自動クリーンアップされます（`SOURCE_DOC_ORPHAN_TTL_HOURS`）。
+## 3. なぜこのUXなのか
 
-## Acceptance smoke
+高品質な最終成果物だけを見せられても、人間は「どこをどう判断すべきか」を掴みにくい。  
+比較対象を並べることで、レビューは次の2軸に分解できます。
 
-```bash
-python scripts/acceptance_smoke.py
-```
+- 共通部分: 両者が一致しているため、守るべき判断として採用しやすい
+- 差異部分: どちらを採るかを決めるための論点として重点的に確認する
+
+これにより、論点整理と再検索の負担を下げ、意思決定を速くします。
+
+## 4. 設計思想
+
+- Evidence-first: 根拠のない指摘はUIに出さない
+- Issue-first: 生diffより先に「判断すべき論点」を提示する
+- Human decision support: 人間の最終判断を助けるために比較と根拠を構造化する
+- Self-Host First: ローカルで再現できる運用を正本にする
+
+## 5. 参照ドキュメント
+
+- `SPEC.md`: 要件、アーキテクチャ、契約の正本
+- `IMPLEMENTATION_STATUS.md`: 実装範囲と運用メモ
+- `PRIORITY_PLAN.md`: 優先した内容と実装計画
+- `UI_REVIEW_SHEET.md`: UIレビュー観点
